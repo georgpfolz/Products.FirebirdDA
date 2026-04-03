@@ -15,7 +15,7 @@ database_type='Firebird'
 import sys
 from _thread import allocate_lock
 
-from .db import DB
+from .db import DB, _DRIVER
 import Shared.DC.ZRDB.Connection
 from App.special_dtml import HTMLFile
 
@@ -47,6 +47,7 @@ def manage_addFirebirdConnection(
 class Connection(Shared.DC.ZRDB.Connection.Connection):
     " "
     database_type=database_type
+    driver_name=_DRIVER
     _isAnSQLConnection = True
     id='%s_database_connection' % database_type
     meta_type=title='%s Database Connection' % database_type

@@ -11,12 +11,32 @@
 #
 ##############################################################################
 import os
-import firebirdsql
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
 import time
 
-from firebirdsql import OperationalError
+# Driver selection via environment variable FIREBIRDDA_DRIVER
+# Supported values: 'firebirdsql', 'firebird-driver'
+# If not set: auto-detect (firebirdsql preferred for backwards compatibility)
+_DRIVER = os.environ.get('FIREBIRDDA_DRIVER', '').strip()
+
+if not _DRIVER:
+    # Auto-detect: firebirdsql preferred for backwards compatibility
+    try:
+        import firebirdsql
+        _DRIVER = 'firebirdsql'
+    except ImportError:
+        _DRIVER = 'firebird-driver'
+
+if _DRIVER == 'firebird-driver':
+    from firebird.driver import connect as _connect
+    from firebird.driver import OperationalError, DatabaseError as Error
+    from firebird.driver.core import TPB
+elif _DRIVER == 'firebirdsql':
+    import firebirdsql
+    from firebirdsql import OperationalError
+    _connect = firebirdsql.connect
+    Error = firebirdsql.Error
 
 with_system_flag=0
 CONNECTION_RETRIES = 5
@@ -33,13 +53,43 @@ def fetchallmap(c):
         r.append(d)
     return r
 
+def _convert_dsn(dsn):
+    """Convert firebirdsql DSN format to firebird-driver format.
+
+    firebirdsql:      host:port/path  host:/path  host/path
+    firebird-driver:  host/port:path  host:/path  host:path
+    """
+    import re
+    # host:port/path -> host/port:path
+    m = re.match(r'^([^:/]+):(\d+)/(.+)$', dsn)
+    if m:
+        return '%s/%s:%s' % (m.group(1), m.group(2), m.group(3))
+    # host:/path
+    m = re.match(r'^([^:/]+):/(.+)$', dsn)
+    if m:
+        path = m.group(2)
+        if '/' not in path:
+            # single component like host:/alias -> host:alias
+            return '%s:%s' % (m.group(1), path)
+        return dsn
+    # host/path -> host:path
+    m = re.match(r'^([^:/]+)/(.+)$', dsn)
+    if m:
+        return '%s:%s' % (m.group(1), m.group(2))
+    return dsn
+
+
 class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
-    database_error=firebirdsql.Error
+    database_error=Error
     opened=None
 
     def open(self):
-        self.conn = firebirdsql.connect(**self.conn_args)
-        self.conn.set_autocommit(True)
+        self.conn = _connect(**self.conn_args)
+        if _DRIVER == 'firebirdsql':
+            self.conn.set_autocommit(True)
+        else:
+            tpb = TPB(auto_commit=True)
+            self.conn.default_tpb = tpb.get_buffer()
         self.opened=DateTime()
 
     def close(self):
@@ -51,6 +101,8 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         for s in connection.split():
             k,v = s.split('=', 1)
             conn_args[k] = v
+        if _DRIVER == 'firebird-driver' and 'dsn' in conn_args:
+            conn_args['database'] = _convert_dsn(conn_args.pop('dsn'))
         self.conn_args = conn_args
         self.db_conn = []
         self.open()
@@ -106,10 +158,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 return items, result
             
             except OperationalError as e:
+                # these errors only occur very briefly
+                # after the firebird server is restarted
+                # soon thereafter, there will be a broken pipe error
                 if e and e.args[0] in ('Can not recv() packets',
-                    # these error only occurs very briefly
-                    # after the firebird server is restarted
-                    # soon thereafter, there will be a broken pipe error
                     '_op_allocate_statement() Invalid db handle'):
                     time.sleep(1)
                     self.close()

@@ -26,6 +26,9 @@ setup(name='Products.FirebirdDA',
           'firebirdsql',
           'Products.ZSQLMethods',
       ],
+      extras_require={
+          'firebird-driver': ['firebird-driver>=1.4.0'],
+      },
       entry_points="""
       # -*- Entry points: -*-
       """,
