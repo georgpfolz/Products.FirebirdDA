@@ -13,7 +13,6 @@
 import os
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
-import time
 
 # Driver selection via environment variable FIREBIRDDA_DRIVER
 # Supported values: 'firebirdsql', 'firebird-driver'
@@ -39,7 +38,6 @@ elif _DRIVER == 'firebirdsql':
     Error = firebirdsql.Error
 
 with_system_flag=0
-CONNECTION_RETRIES = 5
 
 def fetchallmap(c):
     desc = c.description
@@ -93,7 +91,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.opened=DateTime()
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
         self.opened = None
 
     def __init__(self,connection):
@@ -108,11 +109,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.open()
 
     def query(self,query_string, max_rows=9999999):
-        for i in range(CONNECTION_RETRIES):
-            # if necessary: retries for broken pipe,
-            # invalid db handle or recv() packets problem
-            # which can occur when the firebird server is restarted
+        for attempt in range(2):
             try:
+                if self.opened is None:
+                    self.open()
                 c = self.conn.cursor()
 
                 queries=filter(None, [q.strip() for q in query_string.split('\0')])
@@ -156,21 +156,9 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                         })
 
                 return items, result
-            
-            except OperationalError as e:
-                # these errors only occur very briefly
-                # after the firebird server is restarted
-                # soon thereafter, there will be a broken pipe error
-                if e and e.args[0] in ('Can not recv() packets',
-                    '_op_allocate_statement() Invalid db handle'):
-                    time.sleep(1)
-                    self.close()
-                    self.open()
-                elif e and 'too many open handles to database' in e.args[0]:  
-                    self.close()
-                    self.open()
-                else:
-                    raise OperationalError(str(e))
-            except BrokenPipeError:
+
+            except (Error, ConnectionError) as e:
                 self.close()
-                self.open()
+                if attempt > 0:
+                    raise Exception(
+                        'Firebird server is not available: %s' % e)
