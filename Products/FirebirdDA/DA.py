@@ -60,6 +60,11 @@ class Connection(Shared.DC.ZRDB.Connection.Connection):
             return self._v_database_connection.opened
         return ''
 
+    def title_or_id(self):
+        s = self.title or self.id
+        status = 'connected' if self.connected() else 'not connected'
+        return f'{s} ({status})'
+
     def connect(self,s):
         _connections_lock.acquire()
         try:

@@ -81,7 +81,11 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
     database_error=Error
     opened=None
 
+    conn = None
+
     def open(self):
+        if self.conn is not None:
+            self.close()
         self.conn = _connect(**self.conn_args)
         if _DRIVER == 'firebirdsql':
             self.conn.set_autocommit(True)
@@ -91,11 +95,36 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.opened=DateTime()
 
     def close(self):
+        conn = self.conn
+        self.conn = None
+        self.opened = None
+        if conn is None:
+            return
+        if _DRIVER == 'firebird-driver':
+            try:
+                conn.ping()
+            except Exception:
+                # Connection is dead — normal close() would never call
+                # _att.detach() because _close() aborts with DatabaseError
+                # during rollback first. Call detach() directly so fbclient
+                # releases resources and does not accumulate zombie
+                # attachments that block new connections.
+                # Neutralize transaction managers first so their __del__
+                # won't attempt commit/rollback on the dead connection.
+                conn.main_transaction._tra = None
+                conn.query_transaction._tra = None
+                try:
+                    if conn._att is not None:
+                        conn._att.detach()
+                except Exception:
+                    pass
+                finally:
+                    conn._att = None
+                return
         try:
-            self.conn.close()
+            conn.close()
         except Exception:
             pass
-        self.opened = None
 
     def __init__(self,connection):
         conn_args = {}
@@ -113,6 +142,12 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
             try:
                 if self.opened is None:
                     self.open()
+                elif _DRIVER == 'firebird-driver':
+                    try:
+                        self.conn.ping()
+                    except Exception:
+                        self.close()
+                        self.open()
                 c = self.conn.cursor()
 
                 queries=filter(None, [q.strip() for q in query_string.split('\0')])
