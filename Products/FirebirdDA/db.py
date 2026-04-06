@@ -11,6 +11,7 @@
 #
 ##############################################################################
 import os
+import time
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
 
@@ -30,7 +31,8 @@ if not _DRIVER:
 if _DRIVER == 'firebird-driver':
     from firebird.driver import connect as _connect
     from firebird.driver import OperationalError, DatabaseError as Error
-    from firebird.driver.core import TPB
+    from firebird.driver import tpb as _make_tpb
+    from firebird.driver.types import Isolation as _Isolation
 elif _DRIVER == 'firebirdsql':
     import firebirdsql
     from firebirdsql import OperationalError
@@ -38,6 +40,10 @@ elif _DRIVER == 'firebirdsql':
     Error = firebirdsql.Error
 
 with_system_flag=0
+
+# Number of retries in the firebirdsql query loop.
+# Covers brief outages during a Firebird server restart.
+_FIREBIRDSQL_RETRIES = 5
 
 def fetchallmap(c):
     desc = c.description
@@ -90,8 +96,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         if _DRIVER == 'firebirdsql':
             self.conn.set_autocommit(True)
         else:
-            tpb = TPB(auto_commit=True)
-            self.conn.default_tpb = tpb.get_buffer()
+            self.conn.main_transaction.default_tpb = _make_tpb(_Isolation.READ_COMMITTED)
         self.opened=DateTime()
 
     def close(self):
@@ -100,27 +105,6 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.opened = None
         if conn is None:
             return
-        if _DRIVER == 'firebird-driver':
-            try:
-                conn.ping()
-            except Exception:
-                # Connection is dead — normal close() would never call
-                # _att.detach() because _close() aborts with DatabaseError
-                # during rollback first. Call detach() directly so fbclient
-                # releases resources and does not accumulate zombie
-                # attachments that block new connections.
-                # Neutralize transaction managers first so their __del__
-                # won't attempt commit/rollback on the dead connection.
-                conn.main_transaction._tra = None
-                conn.query_transaction._tra = None
-                try:
-                    if conn._att is not None:
-                        conn._att.detach()
-                except Exception:
-                    pass
-                finally:
-                    conn._att = None
-                return
         try:
             conn.close()
         except Exception:
@@ -137,60 +121,100 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.db_conn = []
         self.open()
 
-    def query(self,query_string, max_rows=9999999):
+    def _execute_query(self, query_string, max_rows):
+        """Fuehrt die Query auf self.conn aus. Setzt voraus, dass die
+        Verbindung offen ist. Der Cursor wird garantiert geschlossen.
+        Fuer firebird-driver wird nach der Query committet, damit die
+        naechste Query einen frischen READ_COMMITTED-Snapshot bekommt
+        (fuer firebirdsql nicht noetig, dort ist Autocommit aktiv)."""
+        c = self.conn.cursor()
+        try:
+            queries=filter(None, [q.strip() for q in query_string.split('\0')])
+            if not queries:
+                raise OperationalError('empty query')
+            desc=None
+            result=[]
+            for qs in queries:
+                c.execute(qs)
+
+                d=c.description
+                if d is None: continue
+                if desc is None: desc=d
+                elif d != desc:
+                    raise OperationalError(
+                        'Multiple incompatible selects in '
+                        'multiple sql-statement query'
+                        )
+                if len(result) < max_rows:
+                    r = c.fetchmany(max_rows-len(result))
+                    if r:
+                        result += r
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+        if _DRIVER == 'firebird-driver':
+            self.conn.commit()
+
+        if desc is None:
+            return (), ()
+
+        items=[]
+        for name, type, width, ds, p, scale, null_ok in desc:
+            if type=='NUMBER':
+                if scale==0: type='i'
+                else: type='n'
+            elif type=='DATE':
+                type='d'
+            else: type='s'
+            items.append({
+                'name': name,
+                'type': type,
+                'width': width,
+                'null': null_ok,
+                })
+
+        return items, result
+
+    def query(self, query_string, max_rows=9999999):
+        if _DRIVER == 'firebirdsql':
+            return self._query_firebirdsql(query_string, max_rows)
+        return self._query_firebird_driver(query_string, max_rows)
+
+    def _query_firebirdsql(self, query_string, max_rows):
+        for i in range(_FIREBIRDSQL_RETRIES):
+            # if necessary: retries for broken pipe,
+            # invalid db handle or recv() packets problem
+            # which can occur when the firebird server is restarted
+            try:
+                return self._execute_query(query_string, max_rows)
+
+            except OperationalError as e:
+                if e and e.args[0] in ('Can not recv() packets',
+                    # these error only occurs very briefly
+                    # after the firebird server is restarted
+                    # soon thereafter, there will be a broken pipe error
+                    '_op_allocate_statement() Invalid db handle'):
+                    time.sleep(1)
+                    self.close()
+                    self.open()
+                elif e and 'too many open handles to database' in e.args[0]:
+                    self.close()
+                    self.open()
+                else:
+                    raise OperationalError(str(e))
+            except BrokenPipeError:
+                self.close()
+                self.open()
+
+    def _query_firebird_driver(self, query_string, max_rows):
         for attempt in range(2):
             try:
                 if self.opened is None:
                     self.open()
-                elif _DRIVER == 'firebird-driver':
-                    try:
-                        self.conn.ping()
-                    except Exception:
-                        self.close()
-                        self.open()
-                c = self.conn.cursor()
-
-                queries=filter(None, [q.strip() for q in query_string.split('\0')])
-                if not queries:
-                    raise OperationalError('empty query')
-                desc=None
-                result=[]
-                for qs in queries:
-                    c.execute(qs)
-
-                    d=c.description
-                    if d is None: continue
-                    if desc is None: desc=d
-                    elif d != desc:
-                        raise OperationalError(
-                            'Multiple incompatible selects in '
-                            'multiple sql-statement query'
-                            )
-                    if len(result) < max_rows:
-                        r = c.fetchmany(max_rows-len(result))
-                        if r:
-                            result += r
-
-
-                if desc is None:
-                    return (), ()
-
-                items=[]
-                for name, type, width, ds, p, scale, null_ok in desc:
-                    if type=='NUMBER':
-                        if scale==0: type='i'
-                        else: type='n'
-                    elif type=='DATE':
-                        type='d'
-                    else: type='s'
-                    items.append({
-                        'name': name,
-                        'type': type,
-                        'width': width,
-                        'null': null_ok,
-                        })
-
-                return items, result
+                return self._execute_query(query_string, max_rows)
 
             except (Error, ConnectionError) as e:
                 self.close()
