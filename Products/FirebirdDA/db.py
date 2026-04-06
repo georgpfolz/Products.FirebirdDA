@@ -31,8 +31,10 @@ if not _DRIVER:
 if _DRIVER == 'firebird-driver':
     from firebird.driver import connect as _connect
     from firebird.driver import OperationalError, DatabaseError as Error
+    from firebird.driver import InterfaceError
     from firebird.driver import tpb as _make_tpb
     from firebird.driver.types import Isolation as _Isolation
+    from .gds_codes import RECONNECT_GDS_CODES, gds_name
 elif _DRIVER == 'firebirdsql':
     import firebirdsql
     from firebirdsql import OperationalError
@@ -44,6 +46,81 @@ with_system_flag=0
 # Number of retries in the firebirdsql query loop.
 # Covers brief outages during a Firebird server restart.
 _FIREBIRDSQL_RETRIES = 5
+
+# firebird-driver query loop: how many attempts and how long to wait
+# between them when a transient connection-loss is detected.
+_FIREBIRD_DRIVER_RETRIES = 2
+_FIREBIRD_DRIVER_RETRY_DELAY = 0.5  # seconds
+
+# Substring fallback markers (lower-cased) used to recognise
+# connection-loss situations on exceptions that do not carry
+# gds_codes (e.g. Python-level socket errors raised before the
+# server could return a status vector).
+_RECONNECT_MARKERS = (
+    'broken pipe',
+    'connection lost',
+    'connection closed',
+    'network error',
+    'too many open handles',
+    'shutdown',
+)
+
+
+def _is_firebird_driver_connection_lost(exc):
+    """True if exc indicates a transient connection-loss situation
+    where a reconnect + single retry makes sense."""
+    # BrokenPipeError is a subclass of ConnectionError in Python 3.
+    if isinstance(exc, (ConnectionError, InterfaceError)):
+        return True
+    codes = getattr(exc, 'gds_codes', None) or ()
+    if any(c in RECONNECT_GDS_CODES for c in codes):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _RECONNECT_MARKERS)
+
+
+def _format_firebird_driver_error(exc, query_string):
+    """Build an informative multi-line message from a firebird-driver
+    exception, including the offending SQL, the original driver
+    message, GDS codes with symbolic names, and SQLSTATE/SQLCODE."""
+    parts = ['Firebird query failed.']
+
+    orig = str(exc).strip()
+    if orig:
+        parts.append('')
+        parts.append('Error:')
+        parts.append(orig)
+
+    codes = getattr(exc, 'gds_codes', None) or ()
+    if codes:
+        formatted = []
+        for c in codes:
+            name = gds_name(c)
+            formatted.append(
+                '%d (%s)' % (c, name) if name else str(c))
+        parts.append('')
+        parts.append('GDS codes: ' + ', '.join(formatted))
+
+    sqlstate = getattr(exc, 'sqlstate', None)
+    if sqlstate:
+        if isinstance(sqlstate, bytes):
+            sqlstate = sqlstate.decode('ascii', 'replace')
+        parts.append('SQLSTATE: ' + str(sqlstate))
+
+    sqlcode = getattr(exc, 'sqlcode', None)
+    if sqlcode is not None:
+        parts.append('SQLCODE: %d' % sqlcode)
+
+    if query_string:
+        snippet = query_string.strip()
+        max_len = 2000
+        if len(snippet) > max_len:
+            snippet = snippet[:max_len] + '\n  ... (truncated)'
+        parts.append('')
+        parts.append('SQL:')
+        parts.append(snippet)
+
+    return '\n'.join(parts)
 
 def fetchallmap(c):
     desc = c.description
@@ -129,7 +206,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         (fuer firebirdsql nicht noetig, dort ist Autocommit aktiv)."""
         c = self.conn.cursor()
         try:
-            queries=filter(None, [q.strip() for q in query_string.split('\0')])
+            queries=[q for q in (s.strip() for s in query_string.split('\0')) if q]
             if not queries:
                 raise OperationalError('empty query')
             desc=None
@@ -210,14 +287,37 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 self.open()
 
     def _query_firebird_driver(self, query_string, max_rows):
-        for attempt in range(2):
+        # Defensive: range(0) would skip the loop entirely and leave
+        # last_exc as None, which would lead to a confusing
+        # "raise ... from None". Treat misconfiguration as error.
+        if _FIREBIRD_DRIVER_RETRIES < 1:
+            raise OperationalError(
+                '_FIREBIRD_DRIVER_RETRIES must be >= 1')
+        last_exc = None
+        for attempt in range(_FIREBIRD_DRIVER_RETRIES):
             try:
                 if self.opened is None:
                     self.open()
                 return self._execute_query(query_string, max_rows)
 
             except (Error, ConnectionError) as e:
+                if not _is_firebird_driver_connection_lost(e):
+                    # SQL / logic error: enrich and re-raise so the
+                    # user sees the offending SQL plus driver context
+                    # (GDS codes, SQLSTATE, SQLCODE) in the ZMI Test
+                    # tab. The original exception is chained via
+                    # __cause__.
+                    msg = _format_firebird_driver_error(e, query_string)
+                    raise OperationalError(msg) from e
+                last_exc = e
                 self.close()
-                if attempt > 0:
-                    raise Exception(
-                        'Firebird server is not available: %s' % e)
+                if attempt < _FIREBIRD_DRIVER_RETRIES - 1:
+                    time.sleep(_FIREBIRD_DRIVER_RETRY_DELAY)
+
+        # All retries exhausted: enrich the last connection error too,
+        # so the user gets the same informative diagnosis instead of a
+        # generic "server not available".
+        msg = ('Connection to Firebird lost; reconnect attempts '
+               'exhausted.\n\n' +
+               _format_firebird_driver_error(last_exc, query_string))
+        raise OperationalError(msg) from last_exc
