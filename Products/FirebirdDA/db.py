@@ -94,13 +94,19 @@ def _is_firebird_driver_connection_lost(exc):
     return any(m in msg for m in _RECONNECT_MARKERS)
 
 
-def _caller_may_see_sql():
-    """True if the current Zope user is a Manager — only then is it
-    safe to include the offending SQL snippet in error messages.
-    Anonymous / low-privilege callers (e.g. a public page that
-    triggers a ZSQL Method which then errors) get a sanitised
-    message without the query text. See
-    reference/security-2026-04-09-03-error-sql-snippet-leak.md.
+def _caller_is_manager():
+    """True if the current Zope user has the Manager role. Gates
+    Manager-only conveniences in this DA:
+
+    - Including the offending SQL snippet in error messages
+      (see reference/security-2026-04-09-03-error-sql-snippet-leak.md).
+      Anonymous / low-privilege callers (e.g. a public page that
+      triggers a ZSQL Method which then errors) get a sanitised
+      message without the query text.
+    - Translating ISQL-meta commands (show tables / show table NAME /
+      ...) into system-table queries in _execute_query. Non-Manager
+      callers see those strings passed through to Firebird as-is,
+      producing a normal parse error.
 
     Implemented via has_role(('Manager',)) rather than
     checkPermission, because checkPermission needs an Acquisition-
@@ -122,7 +128,7 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
     everyone else a placeholder is emitted instead, so that an error
     bubbling into a public-facing page does not leak the query text
     (which may contain concatenated user input). The decision is made
-    at the call site via _caller_may_see_sql()."""
+    at the call site via _caller_is_manager()."""
     parts = ['Firebird query failed.']
 
     orig = str(exc).strip()
@@ -379,10 +385,14 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         (fuer firebirdsql nicht noetig, dort ist Autocommit aktiv)."""
         # ISQL-Meta-Commands (show tables, show version, ...) in echte
         # Firebird-System-Queries uebersetzen, damit sie im Zope-Test-Tab
-        # genauso funktionieren wie in isql.
-        translated = _translate_isql_meta(query_string)
-        if translated is not None:
-            query_string = translated
+        # genauso funktionieren wie in isql. Nur fuer Manager-Aufrufer —
+        # analog zur SQL-in-Fehlermeldung-Logik. Nicht-Manager sehen die
+        # Query unveraendert und bekommen einen normalen Firebird-Parse-
+        # Error, wie vor Einfuehrung der ISQL-Meta-Uebersetzung.
+        if _caller_is_manager():
+            translated = _translate_isql_meta(query_string)
+            if translated is not None:
+                query_string = translated
         c = self.conn.cursor()
         try:
             queries=[q for q in (s.strip() for s in query_string.split('\0')) if q]
@@ -493,10 +503,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     # (GDS codes, SQLSTATE, SQLCODE) in the ZMI Test
                     # tab. The original exception is chained via
                     # __cause__. SQL snippet is only included for
-                    # Manager-level callers — see _caller_may_see_sql.
+                    # Manager-level callers — see _caller_is_manager.
                     msg = _format_firebird_driver_error(
                         e, query_string,
-                        include_sql=_caller_may_see_sql())
+                        include_sql=_caller_is_manager())
                     raise OperationalError(msg) from e
                 last_exc = e
                 self.close()
@@ -510,5 +520,5 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                'exhausted.\n\n' +
                _format_firebird_driver_error(
                    last_exc, query_string,
-                   include_sql=_caller_may_see_sql()))
+                   include_sql=_caller_is_manager()))
         raise OperationalError(msg) from last_exc
