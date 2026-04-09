@@ -13,14 +13,10 @@
 database_type='Firebird'
 
 import sys
-from _thread import allocate_lock
 
 from .db import DB, _DRIVER
 import Shared.DC.ZRDB.Connection
 from App.special_dtml import HTMLFile
-
-_connections={}
-_connections_lock=allocate_lock()
 
 
 addConnectionForm=HTMLFile('dtml/connectionAdd',globals())
@@ -65,11 +61,6 @@ class Connection(Shared.DC.ZRDB.Connection.Connection):
         status = 'connected' if self.connected() else 'not connected'
         return f'{s} ({status})'
 
-    def connect(self,s):
-        _connections_lock.acquire()
-        try:
-            c=_connections
-            self._v_database_connection=c[s]=DB(s)
-            return self
-        finally:
-            _connections_lock.release()
+    def connect(self, s):
+        self._v_database_connection = DB(s)
+        return self

@@ -94,10 +94,35 @@ def _is_firebird_driver_connection_lost(exc):
     return any(m in msg for m in _RECONNECT_MARKERS)
 
 
-def _format_firebird_driver_error(exc, query_string):
+def _caller_may_see_sql():
+    """True if the current Zope user is a Manager — only then is it
+    safe to include the offending SQL snippet in error messages.
+    Anonymous / low-privilege callers (e.g. a public page that
+    triggers a ZSQL Method which then errors) get a sanitised
+    message without the query text. See
+    reference/security-2026-04-09-03-error-sql-snippet-leak.md.
+
+    Implemented via has_role(('Manager',)) rather than
+    checkPermission, because checkPermission needs an Acquisition-
+    wrapped context object — which the DB instance does not have."""
+    try:
+        from AccessControl import getSecurityManager
+        return getSecurityManager().getUser().has_role(('Manager',))
+    except Exception:
+        # Outside of a Zope request (e.g. unit test, startup) be
+        # conservative: no SQL in errors.
+        return False
+
+
+def _format_firebird_driver_error(exc, query_string, include_sql=False):
     """Build an informative multi-line message from a firebird-driver
-    exception, including the offending SQL, the original driver
-    message, GDS codes with symbolic names, and SQLSTATE/SQLCODE."""
+    exception, including the original driver message, GDS codes with
+    symbolic names, and SQLSTATE/SQLCODE. The offending SQL is only
+    appended when include_sql=True (i.e. caller is a Manager) — for
+    everyone else a placeholder is emitted instead, so that an error
+    bubbling into a public-facing page does not leak the query text
+    (which may contain concatenated user input). The decision is made
+    at the call site via _caller_may_see_sql()."""
     parts = ['Firebird query failed.']
 
     orig = str(exc).strip()
@@ -126,7 +151,7 @@ def _format_firebird_driver_error(exc, query_string):
     if sqlcode is not None:
         parts.append('SQLCODE: %d' % sqlcode)
 
-    if query_string:
+    if query_string and include_sql:
         snippet = query_string.strip()
         max_len = 2000
         if len(snippet) > max_len:
@@ -134,6 +159,9 @@ def _format_firebird_driver_error(exc, query_string):
         parts.append('')
         parts.append('SQL:')
         parts.append(snippet)
+    elif query_string:
+        parts.append('')
+        parts.append('SQL: <hidden — caller lacks Manager role>')
 
     return '\n'.join(parts)
 
@@ -464,8 +492,11 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     # user sees the offending SQL plus driver context
                     # (GDS codes, SQLSTATE, SQLCODE) in the ZMI Test
                     # tab. The original exception is chained via
-                    # __cause__.
-                    msg = _format_firebird_driver_error(e, query_string)
+                    # __cause__. SQL snippet is only included for
+                    # Manager-level callers — see _caller_may_see_sql.
+                    msg = _format_firebird_driver_error(
+                        e, query_string,
+                        include_sql=_caller_may_see_sql())
                     raise OperationalError(msg) from e
                 last_exc = e
                 self.close()
@@ -477,5 +508,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         # generic "server not available".
         msg = ('Connection to Firebird lost; reconnect attempts '
                'exhausted.\n\n' +
-               _format_firebird_driver_error(last_exc, query_string))
+               _format_firebird_driver_error(
+                   last_exc, query_string,
+                   include_sql=_caller_may_see_sql()))
         raise OperationalError(msg) from last_exc
