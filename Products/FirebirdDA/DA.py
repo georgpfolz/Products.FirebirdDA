@@ -12,8 +12,6 @@
 ##############################################################################
 database_type='Firebird'
 
-import sys
-
 from .db import DB, _DRIVER
 import Shared.DC.ZRDB.Connection
 from App.special_dtml import HTMLFile
@@ -38,15 +36,16 @@ def manage_addFirebirdConnection(
     # and the Connection object constructor.
     self._setObject(id, Connection(
         id, title, connection, check))
-    if REQUEST is not None: return self.manage_main(self,REQUEST)
+    if REQUEST is not None:
+        return self.manage_main(self,REQUEST)
 
 class Connection(Shared.DC.ZRDB.Connection.Connection):
     " "
     database_type=database_type
     driver_name=_DRIVER
     _isAnSQLConnection = True
-    id='%s_database_connection' % database_type
-    meta_type=title='%s Database Connection' % database_type
+    id=f'{database_type}_database_connection'
+    meta_type=title=f'{database_type} Database Connection'
     zmi_icon = 'fas fa-database'
 
     manage_properties=HTMLFile('dtml/connectionEdit', globals())

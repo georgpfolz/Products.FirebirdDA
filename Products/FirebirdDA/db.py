@@ -10,6 +10,7 @@
 # FOR A PARTICULAR PURPOSE
 #
 ##############################################################################
+import contextlib
 import os
 import re
 import time
@@ -37,16 +38,16 @@ if _DRIVER == 'firebird-driver':
     from firebird.driver.types import Isolation as _Isolation
     from .gds_codes import RECONNECT_GDS_CODES, gds_name
 
-    # Eigene OperationalError-Klasse, die NICHT von firebird.base.types.Error
-    # erbt. firebird.base.types.Error definiert __getattr__ so, dass jedes
-    # nicht gesetzte Attribut None zurueckgibt — inklusive __call__. Das
-    # bringt Zopes DocumentTemplate zum Absturz: dessen safe_callable() prueft
-    # per hasattr(e, '__call__') (was True liefert), und ruft dann e() auf
-    # die Exception-Instanz auf. Da e.__call__ aber None ist, crasht das
-    # Rendern von <dtml-var error_value> im ZMI-Test-Tab mit
-    # "TypeError: 'NoneType' object is not callable" — ohne dass die
-    # eigentliche Firebird-Fehlermeldung je beim User ankommt.
-    # Die Original-firebird-driver-Exception haengt als __cause__ dran.
+    # Custom OperationalError class that does NOT inherit from
+    # firebird.base.types.Error. firebird.base.types.Error defines
+    # __getattr__ such that any unset attribute returns None — including
+    # __call__. This crashes Zope's DocumentTemplate: safe_callable()
+    # checks hasattr(e, '__call__') (which returns True) and then calls
+    # e() on the exception instance. Since e.__call__ is None, rendering
+    # <dtml-var error_value> in the ZMI Test tab crashes with
+    # "TypeError: 'NoneType' object is not callable" — without the
+    # actual Firebird error message ever reaching the user.
+    # The original firebird-driver exception is chained via __cause__.
     class OperationalError(Exception):
         """FirebirdDA operational error for the firebird-driver backend."""
         pass
@@ -84,7 +85,7 @@ _RECONNECT_MARKERS = (
 def _is_firebird_driver_connection_lost(exc):
     """True if exc indicates a transient connection-loss situation
     where a reconnect + single retry makes sense."""
-    # BrokenPipeError is a subclass of ConnectionError in Python 3.
+    # BrokenPipeError is a subclass of ConnectionError.
     if isinstance(exc, (ConnectionError, InterfaceError)):
         return True
     codes = getattr(exc, 'gds_codes', None) or ()
@@ -95,40 +96,33 @@ def _is_firebird_driver_connection_lost(exc):
 
 
 def _caller_is_manager():
-    """True if the current Zope user has the Manager role. Gates
-    Manager-only conveniences in this DA:
-
-    - Including the offending SQL snippet in error messages
-      (see reference/security-2026-04-09-03-error-sql-snippet-leak.md).
-      Anonymous / low-privilege callers (e.g. a public page that
-      triggers a ZSQL Method which then errors) get a sanitised
-      message without the query text.
-    - Translating ISQL-meta commands (show tables / show table NAME /
-      ...) into system-table queries in _execute_query. Non-Manager
-      callers see those strings passed through to Firebird as-is,
-      producing a normal parse error.
-
-    Implemented via has_role(('Manager',)) rather than
-    checkPermission, because checkPermission needs an Acquisition-
-    wrapped context object — which the DB instance does not have."""
+    """True if the current Zope user has the Manager role."""
+    # Gates two Manager-only conveniences in this DA: including the
+    # offending SQL snippet in error messages, and translating ISQL
+    # meta commands (show tables / show table NAME / ...) into
+    # system-table queries in _execute_query. Non-Manager callers get
+    # sanitised errors without SQL and see meta commands passed
+    # through to Firebird as-is (producing a normal parse error).
+    #
+    # Uses has_role(('Manager',)) instead of checkPermission because
+    # checkPermission needs an Acquisition-wrapped context object,
+    # which the DB instance does not have.
     try:
         from AccessControl import getSecurityManager
         return getSecurityManager().getUser().has_role(('Manager',))
     except Exception:
-        # Outside of a Zope request (e.g. unit test, startup) be
-        # conservative: no SQL in errors.
+        # Outside a Zope request (unit test, startup) be conservative:
+        # no SQL in errors.
         return False
 
 
 def _format_firebird_driver_error(exc, query_string, include_sql=False):
-    """Build an informative multi-line message from a firebird-driver
-    exception, including the original driver message, GDS codes with
-    symbolic names, and SQLSTATE/SQLCODE. The offending SQL is only
-    appended when include_sql=True (i.e. caller is a Manager) — for
-    everyone else a placeholder is emitted instead, so that an error
-    bubbling into a public-facing page does not leak the query text
-    (which may contain concatenated user input). The decision is made
-    at the call site via _caller_is_manager()."""
+    """Format a firebird-driver exception as a multi-line message
+    (driver message, GDS codes, SQLSTATE, SQLCODE, optional SQL)."""
+    # include_sql is gated by _caller_is_manager() at the call site:
+    # non-Manager callers get a placeholder instead of the query text,
+    # so errors bubbling into a public-facing page do not leak SQL
+    # that may contain concatenated user input.
     parts = ['Firebird query failed.']
 
     orig = str(exc).strip()
@@ -142,20 +136,19 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
         formatted = []
         for c in codes:
             name = gds_name(c)
-            formatted.append(
-                '%d (%s)' % (c, name) if name else str(c))
+            formatted.append(f'{c} ({name})' if name else str(c))
         parts.append('')
-        parts.append('GDS codes: ' + ', '.join(formatted))
+        parts.append(f"GDS codes: {', '.join(formatted)}")
 
     sqlstate = getattr(exc, 'sqlstate', None)
     if sqlstate:
         if isinstance(sqlstate, bytes):
             sqlstate = sqlstate.decode('ascii', 'replace')
-        parts.append('SQLSTATE: ' + str(sqlstate))
+        parts.append(f'SQLSTATE: {sqlstate}')
 
     sqlcode = getattr(exc, 'sqlcode', None)
     if sqlcode is not None:
-        parts.append('SQLCODE: %d' % sqlcode)
+        parts.append(f'SQLCODE: {sqlcode}')
 
     if query_string and include_sql:
         snippet = query_string.strip()
@@ -171,10 +164,10 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
 
     return '\n'.join(parts)
 
-# ISQL-Meta-Kommandos, die isql nativ unterstuetzt, Firebird-SQL aber nicht.
-# Im ZMI-Test-Tab werden sie in echte System-Queries uebersetzt, damit sie
-# genauso funktionieren wie in isql. Exakte Treffer: _ISQL_META_COMMANDS.
-# Parametrisierte Varianten (show table NAME): _translate_isql_meta().
+# ISQL meta commands that isql supports natively but Firebird SQL does
+# not. In the ZMI Test tab they are translated into real system queries
+# so they work the same as in isql. Exact matches: _ISQL_META_COMMANDS.
+# Parameterised variants (show table NAME): _translate_isql_meta().
 _ISQL_META_COMMANDS = {
     'show tables': (
         "SELECT TRIM(RDB$RELATION_NAME) AS TABLE_NAME "
@@ -202,9 +195,9 @@ _ISQL_META_COMMANDS = {
 }
 
 
-# Firebird RDB$FIELDS.RDB$FIELD_TYPE -> lesbarer SQL-Typname.
-# Deckt die gaengigen Spaltentypen ab; unbekannte Typen werden als
-# numerischer Code ausgegeben.
+# Firebird RDB$FIELDS.RDB$FIELD_TYPE -> readable SQL type name.
+# Covers the common column types; unknown types are emitted as a
+# numeric code.
 _FB_FIELD_TYPE_CASE = """
   CASE f.RDB$FIELD_TYPE
     WHEN 7 THEN
@@ -249,9 +242,9 @@ _FB_FIELD_TYPE_CASE = """
   END
 """
 
-# Query fuer "show table NAME": Spaltenliste mit Typ, Laenge, Nullability,
-# Default. {name} wird vom Translator mit dem geprueften Tabellennamen
-# befuellt (immer schon validiert, daher kein SQL-Injection-Risiko).
+# Query for "show table NAME": column list with type, length, nullability,
+# default. {name} is filled in by the translator with the validated table
+# name (always pre-validated, so no SQL-injection risk).
 _SHOW_TABLE_SQL = (
     "SELECT "
     "TRIM(rf.RDB$FIELD_NAME) AS FIELD_NAME, "
@@ -265,10 +258,6 @@ _SHOW_TABLE_SQL = (
     "ORDER BY rf.RDB$FIELD_POSITION"
 )
 
-# Gueltige unquoted Firebird-Identifier (Buchstaben, Ziffern, Underscore,
-# Dollar; muss mit Buchstabe beginnen). Quoted Identifier ("FooBar") werden
-# separat behandelt und case-preserving eingesetzt.
-_IDENT_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_$]*$')
 _SHOW_TABLE_RE = re.compile(
     r'^show\s+table\s+(?:"([^"]+)"|([A-Za-z][A-Za-z0-9_$]*))\s*;?\s*$',
     re.IGNORECASE,
@@ -276,11 +265,11 @@ _SHOW_TABLE_RE = re.compile(
 
 
 def _translate_isql_meta(query_string):
-    """Wenn query_string einem bekannten ISQL-Meta-Kommando entspricht
-    (case-insensitive, whitespace normalisiert, optional trailing ';'),
-    liefere die entsprechende Firebird-SQL-Query. Sonst None."""
+    """If query_string matches a known ISQL meta command
+    (case-insensitive, whitespace normalised, optional trailing ';'),
+    return the corresponding Firebird SQL query. Otherwise None."""
     stripped = query_string.strip()
-    # 1) Exakte Treffer (show tables / show version / ...)
+    # 1) Exact matches (show tables / show version / ...)
     key = ' '.join(stripped.rstrip(';').strip().lower().split())
     sql = _ISQL_META_COMMANDS.get(key)
     if sql is not None:
@@ -289,12 +278,12 @@ def _translate_isql_meta(query_string):
     m = _SHOW_TABLE_RE.match(stripped)
     if m:
         quoted, unquoted = m.group(1), m.group(2)
-        # Firebird speichert unquoted Identifier in Uppercase in den
-        # System-Tabellen. Quoted Identifier behalten ihre Schreibweise.
+        # Firebird stores unquoted identifiers in uppercase in the
+        # system tables. Quoted identifiers keep their case.
         name = quoted if quoted is not None else unquoted.upper()
-        # Sicherheitsnetz gegen SQL-Injection: nur erlaubte Zeichen im
-        # Namen zulassen. Quoted Identifier duerfen Leerzeichen etc.
-        # enthalten, daher hier nur das Apostroph als Terminator blocken.
+        # SQL-injection safety net: only allow safe characters in the
+        # name. Quoted identifiers may contain spaces etc., so here we
+        # only block the apostrophe as a string terminator.
         if "'" in name:
             return None
         return _SHOW_TABLE_SQL.format(name=name)
@@ -302,14 +291,17 @@ def _translate_isql_meta(query_string):
 
 
 def fetchallmap(c):
+    """Fetch all rows from cursor c as a list of {column_name: value} dicts."""
     desc = c.description
     r = []
     for row in c.fetchall():
         d = {}
-        for i in range(len(desc)):
-            key = str(desc[i][0])
-            try: d[key] = row[i].strip()
-            except: d[key] = row[i]
+        for col, value in zip(desc, row):
+            key = str(col[0])
+            try:
+                d[key] = value.strip()
+            except AttributeError:
+                d[key] = value
         r.append(d)
     return r
 
@@ -319,23 +311,22 @@ def _convert_dsn(dsn):
     firebirdsql:      host:port/path  host:/path  host/path
     firebird-driver:  host/port:path  host:/path  host:path
     """
-    import re
     # host:port/path -> host/port:path
     m = re.match(r'^([^:/]+):(\d+)/(.+)$', dsn)
     if m:
-        return '%s/%s:%s' % (m.group(1), m.group(2), m.group(3))
+        return f'{m.group(1)}/{m.group(2)}:{m.group(3)}'
     # host:/path
     m = re.match(r'^([^:/]+):/(.+)$', dsn)
     if m:
         path = m.group(2)
         if '/' not in path:
             # single component like host:/alias -> host:alias
-            return '%s:%s' % (m.group(1), path)
+            return f'{m.group(1)}:{path}'
         return dsn
     # host/path -> host:path
     m = re.match(r'^([^:/]+)/(.+)$', dsn)
     if m:
-        return '%s:%s' % (m.group(1), m.group(2))
+        return f'{m.group(1)}:{m.group(2)}'
     return dsn
 
 
@@ -361,16 +352,13 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.opened = None
         if conn is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             conn.close()
-        except Exception:
-            pass
 
     def __init__(self,connection):
-        conn_args = {}
-        for s in connection.split():
-            k,v = s.split('=', 1)
-            conn_args[k] = v
+        conn_args = dict(
+            s.split('=', 1) for s in connection.split()
+        )
         if _DRIVER == 'firebird-driver' and 'dsn' in conn_args:
             conn_args['database'] = _convert_dsn(conn_args.pop('dsn'))
         self.conn_args = conn_args
@@ -378,17 +366,13 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.open()
 
     def _execute_query(self, query_string, max_rows):
-        """Fuehrt die Query auf self.conn aus. Setzt voraus, dass die
-        Verbindung offen ist. Der Cursor wird garantiert geschlossen.
-        Fuer firebird-driver wird nach der Query committet, damit die
-        naechste Query einen frischen READ_COMMITTED-Snapshot bekommt
-        (fuer firebirdsql nicht noetig, dort ist Autocommit aktiv)."""
-        # ISQL-Meta-Commands (show tables, show version, ...) in echte
-        # Firebird-System-Queries uebersetzen, damit sie im Zope-Test-Tab
-        # genauso funktionieren wie in isql. Nur fuer Manager-Aufrufer —
-        # analog zur SQL-in-Fehlermeldung-Logik. Nicht-Manager sehen die
-        # Query unveraendert und bekommen einen normalen Firebird-Parse-
-        # Error, wie vor Einfuehrung der ISQL-Meta-Uebersetzung.
+        """Execute query_string on self.conn and return (items, rows)."""
+        # Translate ISQL meta commands (show tables, show version, ...)
+        # into real Firebird system queries so they work the same in
+        # the Zope Test tab as in isql. Manager callers only — same
+        # policy as the SQL-in-error-message logic. Non-Manager callers
+        # see the query unchanged and get a normal Firebird parse
+        # error, just like before the ISQL meta translation existed.
         if _caller_is_manager():
             translated = _translate_isql_meta(query_string)
             if translated is not None:
@@ -404,7 +388,8 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 c.execute(qs)
 
                 d=c.description
-                if d is None: continue
+                if d is None:
+                    continue
                 if desc is None: desc=d
                 elif d != desc:
                     raise OperationalError(
@@ -416,28 +401,28 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     if r:
                         result += r
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 c.close()
-            except Exception:
-                pass
 
         if _DRIVER == 'firebird-driver':
+            # Commit so the next query gets a fresh READ_COMMITTED
+            # snapshot. Not needed for firebirdsql (autocommit is on).
             self.conn.commit()
 
         if desc is None:
             return (), ()
 
         items=[]
-        for name, type, width, ds, p, scale, null_ok in desc:
-            if type=='NUMBER':
-                if scale==0: type='i'
-                else: type='n'
-            elif type=='DATE':
-                type='d'
-            else: type='s'
+        for name, type_, width, ds, p, scale, null_ok in desc:
+            if type_=='NUMBER':
+                if scale==0: type_='i'
+                else: type_='n'
+            elif type_=='DATE':
+                type_='d'
+            else: type_='s'
             items.append({
                 'name': name,
-                'type': type,
+                'type': type_,
                 'width': width,
                 'null': null_ok,
                 })
@@ -445,16 +430,18 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         return items, result
 
     def query(self, query_string, max_rows=9999999):
+        """Public entry point — dispatch to the active driver backend."""
         if _DRIVER == 'firebirdsql':
             return self._query_firebirdsql(query_string, max_rows)
         return self._query_firebird_driver(query_string, max_rows)
 
     def _query_firebirdsql(self, query_string, max_rows):
+        """Run query via firebirdsql with retries for transient errors."""
+        # Retries cover broken pipe, invalid db handle and recv()
+        # packet problems that occur briefly when the Firebird server
+        # is restarted.
         last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
-            # if necessary: retries for broken pipe,
-            # invalid db handle or recv() packets problem
-            # which can occur when the firebird server is restarted
             try:
                 return self._execute_query(query_string, max_rows)
 
@@ -472,17 +459,18 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     self.close()
                     self.open()
                 else:
-                    raise OperationalError(str(e))
+                    raise OperationalError(str(e)) from e
             except BrokenPipeError as e:
                 last_exc = e
                 self.close()
                 self.open()
         raise OperationalError(
-            'Firebird query failed after %d retries: %s'
-            % (_FIREBIRDSQL_RETRIES, last_exc)
+            f'Firebird query failed after {_FIREBIRDSQL_RETRIES} '
+            f'retries: {last_exc}'
         ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
+        """Run query via firebird-driver with enrichment of error messages."""
         # Defensive: range(0) would skip the loop entirely and leave
         # last_exc as None, which would lead to a confusing
         # "raise ... from None". Treat misconfiguration as error.
