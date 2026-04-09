@@ -412,6 +412,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         return self._query_firebird_driver(query_string, max_rows)
 
     def _query_firebirdsql(self, query_string, max_rows):
+        last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
             # if necessary: retries for broken pipe,
             # invalid db handle or recv() packets problem
@@ -420,6 +421,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 return self._execute_query(query_string, max_rows)
 
             except OperationalError as e:
+                last_exc = e
                 if e and e.args[0] in ('Can not recv() packets',
                     # these error only occurs very briefly
                     # after the firebird server is restarted
@@ -433,9 +435,14 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     self.open()
                 else:
                     raise OperationalError(str(e))
-            except BrokenPipeError:
+            except BrokenPipeError as e:
+                last_exc = e
                 self.close()
                 self.open()
+        raise OperationalError(
+            'Firebird query failed after %d retries: %s'
+            % (_FIREBIRDSQL_RETRIES, last_exc)
+        ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
         # Defensive: range(0) would skip the loop entirely and leave
