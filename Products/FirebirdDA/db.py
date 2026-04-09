@@ -11,6 +11,7 @@
 #
 ##############################################################################
 import os
+import re
 import time
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
@@ -30,11 +31,25 @@ if not _DRIVER:
 
 if _DRIVER == 'firebird-driver':
     from firebird.driver import connect as _connect
-    from firebird.driver import OperationalError, DatabaseError as Error
+    from firebird.driver import DatabaseError as Error
     from firebird.driver import InterfaceError
     from firebird.driver import tpb as _make_tpb
     from firebird.driver.types import Isolation as _Isolation
     from .gds_codes import RECONNECT_GDS_CODES, gds_name
+
+    # Eigene OperationalError-Klasse, die NICHT von firebird.base.types.Error
+    # erbt. firebird.base.types.Error definiert __getattr__ so, dass jedes
+    # nicht gesetzte Attribut None zurueckgibt — inklusive __call__. Das
+    # bringt Zopes DocumentTemplate zum Absturz: dessen safe_callable() prueft
+    # per hasattr(e, '__call__') (was True liefert), und ruft dann e() auf
+    # die Exception-Instanz auf. Da e.__call__ aber None ist, crasht das
+    # Rendern von <dtml-var error_value> im ZMI-Test-Tab mit
+    # "TypeError: 'NoneType' object is not callable" — ohne dass die
+    # eigentliche Firebird-Fehlermeldung je beim User ankommt.
+    # Die Original-firebird-driver-Exception haengt als __cause__ dran.
+    class OperationalError(Exception):
+        """FirebirdDA operational error for the firebird-driver backend."""
+        pass
 elif _DRIVER == 'firebirdsql':
     import firebirdsql
     from firebirdsql import OperationalError
@@ -122,6 +137,136 @@ def _format_firebird_driver_error(exc, query_string):
 
     return '\n'.join(parts)
 
+# ISQL-Meta-Kommandos, die isql nativ unterstuetzt, Firebird-SQL aber nicht.
+# Im ZMI-Test-Tab werden sie in echte System-Queries uebersetzt, damit sie
+# genauso funktionieren wie in isql. Exakte Treffer: _ISQL_META_COMMANDS.
+# Parametrisierte Varianten (show table NAME): _translate_isql_meta().
+_ISQL_META_COMMANDS = {
+    'show tables': (
+        "SELECT TRIM(RDB$RELATION_NAME) AS TABLE_NAME "
+        "FROM RDB$RELATIONS "
+        "WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL "
+        "ORDER BY RDB$RELATION_NAME"
+    ),
+    'show views': (
+        "SELECT TRIM(RDB$RELATION_NAME) AS VIEW_NAME "
+        "FROM RDB$RELATIONS "
+        "WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NOT NULL "
+        "ORDER BY RDB$RELATION_NAME"
+    ),
+    'show version': (
+        "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS VERSION "
+        "FROM RDB$DATABASE"
+    ),
+    'show database': (
+        "SELECT "
+        "rdb$get_context('SYSTEM', 'DB_NAME') AS DATABASE_NAME, "
+        "rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS ENGINE_VERSION, "
+        "rdb$get_context('SYSTEM', 'CURRENT_USER') AS CURRENT_USER "
+        "FROM RDB$DATABASE"
+    ),
+}
+
+
+# Firebird RDB$FIELDS.RDB$FIELD_TYPE -> lesbarer SQL-Typname.
+# Deckt die gaengigen Spaltentypen ab; unbekannte Typen werden als
+# numerischer Code ausgegeben.
+_FB_FIELD_TYPE_CASE = """
+  CASE f.RDB$FIELD_TYPE
+    WHEN 7 THEN
+      CASE f.RDB$FIELD_SUB_TYPE
+        WHEN 1 THEN 'NUMERIC(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        WHEN 2 THEN 'DECIMAL(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        ELSE 'SMALLINT'
+      END
+    WHEN 8 THEN
+      CASE f.RDB$FIELD_SUB_TYPE
+        WHEN 1 THEN 'NUMERIC(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        WHEN 2 THEN 'DECIMAL(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        ELSE 'INTEGER'
+      END
+    WHEN 10 THEN 'FLOAT'
+    WHEN 12 THEN 'DATE'
+    WHEN 13 THEN 'TIME'
+    WHEN 14 THEN 'CHAR(' || f.RDB$CHARACTER_LENGTH || ')'
+    WHEN 16 THEN
+      CASE f.RDB$FIELD_SUB_TYPE
+        WHEN 1 THEN 'NUMERIC(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        WHEN 2 THEN 'DECIMAL(' || f.RDB$FIELD_PRECISION || ',' ||
+                    (-f.RDB$FIELD_SCALE) || ')'
+        ELSE 'BIGINT'
+      END
+    WHEN 27 THEN 'DOUBLE PRECISION'
+    WHEN 35 THEN 'TIMESTAMP'
+    WHEN 37 THEN 'VARCHAR(' || f.RDB$CHARACTER_LENGTH || ')'
+    WHEN 261 THEN
+      'BLOB SUB_TYPE ' ||
+      CASE f.RDB$FIELD_SUB_TYPE
+        WHEN 0 THEN 'BINARY'
+        WHEN 1 THEN 'TEXT'
+        ELSE CAST(f.RDB$FIELD_SUB_TYPE AS VARCHAR(10))
+      END
+    ELSE 'TYPE_' || CAST(f.RDB$FIELD_TYPE AS VARCHAR(10))
+  END
+"""
+
+# Query fuer "show table NAME": Spaltenliste mit Typ, Laenge, Nullability,
+# Default. {name} wird vom Translator mit dem geprueften Tabellennamen
+# befuellt (immer schon validiert, daher kein SQL-Injection-Risiko).
+_SHOW_TABLE_SQL = (
+    "SELECT "
+    "TRIM(rf.RDB$FIELD_NAME) AS FIELD_NAME, "
+    + _FB_FIELD_TYPE_CASE.strip() + " AS FIELD_TYPE, "
+    "CASE WHEN COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG) = 1 "
+    "THEN 'NOT NULL' ELSE '' END AS NULLABLE, "
+    "COALESCE(rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE) AS DEFAULT_VALUE "
+    "FROM RDB$RELATION_FIELDS rf "
+    "JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME "
+    "WHERE rf.RDB$RELATION_NAME = '{name}' "
+    "ORDER BY rf.RDB$FIELD_POSITION"
+)
+
+# Gueltige unquoted Firebird-Identifier (Buchstaben, Ziffern, Underscore,
+# Dollar; muss mit Buchstabe beginnen). Quoted Identifier ("FooBar") werden
+# separat behandelt und case-preserving eingesetzt.
+_IDENT_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_$]*$')
+_SHOW_TABLE_RE = re.compile(
+    r'^show\s+table\s+(?:"([^"]+)"|([A-Za-z][A-Za-z0-9_$]*))\s*;?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _translate_isql_meta(query_string):
+    """Wenn query_string einem bekannten ISQL-Meta-Kommando entspricht
+    (case-insensitive, whitespace normalisiert, optional trailing ';'),
+    liefere die entsprechende Firebird-SQL-Query. Sonst None."""
+    stripped = query_string.strip()
+    # 1) Exakte Treffer (show tables / show version / ...)
+    key = ' '.join(stripped.rstrip(';').strip().lower().split())
+    sql = _ISQL_META_COMMANDS.get(key)
+    if sql is not None:
+        return sql
+    # 2) show table NAME  /  show table "Name"
+    m = _SHOW_TABLE_RE.match(stripped)
+    if m:
+        quoted, unquoted = m.group(1), m.group(2)
+        # Firebird speichert unquoted Identifier in Uppercase in den
+        # System-Tabellen. Quoted Identifier behalten ihre Schreibweise.
+        name = quoted if quoted is not None else unquoted.upper()
+        # Sicherheitsnetz gegen SQL-Injection: nur erlaubte Zeichen im
+        # Namen zulassen. Quoted Identifier duerfen Leerzeichen etc.
+        # enthalten, daher hier nur das Apostroph als Terminator blocken.
+        if "'" in name:
+            return None
+        return _SHOW_TABLE_SQL.format(name=name)
+    return None
+
+
 def fetchallmap(c):
     desc = c.description
     r = []
@@ -204,6 +349,12 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         Fuer firebird-driver wird nach der Query committet, damit die
         naechste Query einen frischen READ_COMMITTED-Snapshot bekommt
         (fuer firebirdsql nicht noetig, dort ist Autocommit aktiv)."""
+        # ISQL-Meta-Commands (show tables, show version, ...) in echte
+        # Firebird-System-Queries uebersetzen, damit sie im Zope-Test-Tab
+        # genauso funktionieren wie in isql.
+        translated = _translate_isql_meta(query_string)
+        if translated is not None:
+            query_string = translated
         c = self.conn.cursor()
         try:
             queries=[q for q in (s.strip() for s in query_string.split('\0')) if q]
