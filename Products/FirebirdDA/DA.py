@@ -44,8 +44,7 @@ class Connection(Shared.DC.ZRDB.Connection.Connection):
     database_type=database_type
     driver_name=_DRIVER
     _isAnSQLConnection = True
-    id=f'{database_type}_database_connection'
-    meta_type=title=f'{database_type} Database Connection'
+    meta_type = f'{database_type} Database Connection'
     zmi_icon = 'fas fa-database'
 
     manage_properties=HTMLFile('dtml/connectionEdit', globals())
