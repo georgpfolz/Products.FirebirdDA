@@ -11,6 +11,8 @@
 #
 ##############################################################################
 import contextlib
+import datetime
+import decimal
 import os
 import re
 import time
@@ -55,11 +57,56 @@ if _DRIVER == 'firebird-driver':
         The original firebird-driver exception is chained via __cause__.
         """
         pass
+
+    # cursor.description type_code → ZRDB type character.
+    # firebird-driver returns Python types (int, float, ...).
+    def _zrdb_type(type_code, scale):
+        if type_code is int:
+            return 'i'
+        if type_code in (float, decimal.Decimal):
+            return 'n'
+        if type_code in (datetime.date, datetime.datetime, datetime.time):
+            return 'd'
+        return 's'
+
 elif _DRIVER == 'firebirdsql':
     import firebirdsql
     from firebirdsql import OperationalError
     _connect = firebirdsql.connect
     Error = firebirdsql.Error
+
+    # cursor.description type_code → ZRDB type character.
+    # firebirdsql returns ISC numeric type codes.
+    _INTEGER_OR_DECIMAL_CODES = frozenset({
+        firebirdsql.SQL_TYPE_SHORT,     # 500
+        firebirdsql.SQL_TYPE_LONG,      # 496
+        firebirdsql.SQL_TYPE_INT64,     # 580
+        firebirdsql.SQL_TYPE_INT128,    # 32752
+    })
+    _FLOAT_CODES = frozenset({
+        firebirdsql.SQL_TYPE_FLOAT,     # 482
+        firebirdsql.SQL_TYPE_DOUBLE,    # 480
+        firebirdsql.SQL_TYPE_D_FLOAT,   # 530
+        firebirdsql.SQL_TYPE_DEC64,     # 32760
+        firebirdsql.SQL_TYPE_DEC128,    # 32762
+        firebirdsql.SQL_TYPE_DEC_FIXED, # 32758
+    })
+    _DATE_CODES = frozenset({
+        firebirdsql.SQL_TYPE_DATE,         # 570
+        firebirdsql.SQL_TYPE_TIME,         # 560
+        firebirdsql.SQL_TYPE_TIMESTAMP,    # 510
+        firebirdsql.SQL_TYPE_TIMESTAMP_TZ, # 32754
+        firebirdsql.SQL_TYPE_TIME_TZ,      # 32756
+    })
+
+    def _zrdb_type(type_code, scale):
+        if type_code in _INTEGER_OR_DECIMAL_CODES:
+            return 'i' if scale == 0 else 'n'
+        if type_code in _FLOAT_CODES:
+            return 'n'
+        if type_code in _DATE_CODES:
+            return 'd'
+        return 's'
 
 with_system_flag=0
 
@@ -250,7 +297,6 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         if _DRIVER == 'firebird-driver' and 'dsn' in conn_args:
             conn_args['database'] = _convert_dsn(conn_args.pop('dsn'))
         self.conn_args = conn_args
-        self.db_conn = []
         self.open()
 
     def _execute_query(self, query_string, max_rows):
@@ -303,16 +349,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
             return (), ()
 
         items=[]
-        for name, type_, width, ds, p, scale, null_ok in desc:
-            if type_=='NUMBER':
-                if scale==0: type_='i'
-                else: type_='n'
-            elif type_=='DATE':
-                type_='d'
-            else: type_='s'
+        for name, type_code, width, ds, p, scale, null_ok in desc:
             items.append({
                 'name': name,
-                'type': type_,
+                'type': _zrdb_type(type_code, scale),
                 'width': width,
                 'null': null_ok,
                 })
