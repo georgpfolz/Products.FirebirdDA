@@ -16,6 +16,7 @@ import decimal
 import os
 import re
 import time
+
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
 
@@ -24,34 +25,38 @@ from .isql_meta import translate_isql_meta
 # Driver selection via environment variable FIREBIRDDA_DRIVER
 # Supported values: 'firebirdsql', 'firebird-driver'
 # If not set: auto-detect (firebirdsql preferred for backwards compatibility)
-_DRIVER = os.environ.get('FIREBIRDDA_DRIVER', '').strip()
+_DRIVER = os.environ.get("FIREBIRDDA_DRIVER", "").strip()
 
 if not _DRIVER:
     # Auto-detect: firebirdsql preferred for backwards compatibility
     try:
         import firebirdsql
-        _DRIVER = 'firebirdsql'
-    except ImportError:
-        _DRIVER = 'firebird-driver'
 
-if _DRIVER == 'firebird-driver':
-    from firebird.driver import connect as _connect
+        _DRIVER = "firebirdsql"
+    except ImportError:
+        _DRIVER = "firebird-driver"
+
+if _DRIVER == "firebird-driver":
     from firebird.driver import DatabaseError as Error
     from firebird.driver import InterfaceError
+    from firebird.driver import connect as _connect
     from firebird.driver import tpb as _make_tpb
     from firebird.driver.types import Isolation as _Isolation
+
     # GDS codes that indicate a lost or unusable connection where
     # a reconnect + retry is appropriate.
-    RECONNECT_GDS_CODES: frozenset[int] = frozenset({
-        335544648,   # connection lost to database (pipe)
-        335544721,   # network error
-        335544722,   # Unable to complete network request
-        335544726,   # Error reading data from the connection
-        335544727,   # Error writing data to the connection
-        335544741,   # connection lost to database
-        335544761,   # too many open handles to database
-        335544856,   # connection shutdown
-    })
+    RECONNECT_GDS_CODES: frozenset[int] = frozenset(
+        {
+            335544648,  # connection lost to database (pipe)
+            335544721,  # network error
+            335544722,  # Unable to complete network request
+            335544726,  # Error reading data from the connection
+            335544727,  # Error writing data to the connection
+            335544741,  # connection lost to database
+            335544761,  # too many open handles to database
+            335544856,  # connection shutdown
+        }
+    )
 
     class OperationalError(Exception):
         """FirebirdDA operational error for the firebird-driver backend.
@@ -67,59 +72,68 @@ if _DRIVER == 'firebird-driver':
 
         The original firebird-driver exception is chained via __cause__.
         """
+
         pass
 
     # cursor.description type_code → ZRDB type character.
     # firebird-driver returns Python types (int, float, ...).
     def _zrdb_type(type_code, scale):
         if type_code is int:
-            return 'i'
+            return "i"
         if type_code in (float, decimal.Decimal):
-            return 'n'
+            return "n"
         if type_code in (datetime.date, datetime.datetime, datetime.time):
-            return 'd'
-        return 's'
+            return "d"
+        return "s"
 
-elif _DRIVER == 'firebirdsql':
+elif _DRIVER == "firebirdsql":
     import firebirdsql
     from firebirdsql import OperationalError
+
     _connect = firebirdsql.connect
     Error = firebirdsql.Error
 
     # cursor.description type_code → ZRDB type character.
     # firebirdsql returns ISC numeric type codes.
-    _INTEGER_OR_DECIMAL_CODES = frozenset({
-        firebirdsql.SQL_TYPE_SHORT,     # 500
-        firebirdsql.SQL_TYPE_LONG,      # 496
-        firebirdsql.SQL_TYPE_INT64,     # 580
-        firebirdsql.SQL_TYPE_INT128,    # 32752
-    })
-    _FLOAT_CODES = frozenset({
-        firebirdsql.SQL_TYPE_FLOAT,     # 482
-        firebirdsql.SQL_TYPE_DOUBLE,    # 480
-        firebirdsql.SQL_TYPE_D_FLOAT,   # 530
-        firebirdsql.SQL_TYPE_DEC64,     # 32760
-        firebirdsql.SQL_TYPE_DEC128,    # 32762
-        firebirdsql.SQL_TYPE_DEC_FIXED, # 32758
-    })
-    _DATE_CODES = frozenset({
-        firebirdsql.SQL_TYPE_DATE,         # 570
-        firebirdsql.SQL_TYPE_TIME,         # 560
-        firebirdsql.SQL_TYPE_TIMESTAMP,    # 510
-        firebirdsql.SQL_TYPE_TIMESTAMP_TZ, # 32754
-        firebirdsql.SQL_TYPE_TIME_TZ,      # 32756
-    })
+    _INTEGER_OR_DECIMAL_CODES = frozenset(
+        {
+            firebirdsql.SQL_TYPE_SHORT,  # 500
+            firebirdsql.SQL_TYPE_LONG,  # 496
+            firebirdsql.SQL_TYPE_INT64,  # 580
+            firebirdsql.SQL_TYPE_INT128,  # 32752
+        }
+    )
+    _FLOAT_CODES = frozenset(
+        {
+            firebirdsql.SQL_TYPE_FLOAT,  # 482
+            firebirdsql.SQL_TYPE_DOUBLE,  # 480
+            firebirdsql.SQL_TYPE_D_FLOAT,  # 530
+            firebirdsql.SQL_TYPE_DEC64,  # 32760
+            firebirdsql.SQL_TYPE_DEC128,  # 32762
+            firebirdsql.SQL_TYPE_DEC_FIXED,  # 32758
+        }
+    )
+    _DATE_CODES = frozenset(
+        {
+            firebirdsql.SQL_TYPE_DATE,  # 570
+            firebirdsql.SQL_TYPE_TIME,  # 560
+            firebirdsql.SQL_TYPE_TIMESTAMP,  # 510
+            firebirdsql.SQL_TYPE_TIMESTAMP_TZ,  # 32754
+            firebirdsql.SQL_TYPE_TIME_TZ,  # 32756
+        }
+    )
 
     def _zrdb_type(type_code, scale):
         if type_code in _INTEGER_OR_DECIMAL_CODES:
-            return 'i' if scale == 0 else 'n'
+            return "i" if scale == 0 else "n"
         if type_code in _FLOAT_CODES:
-            return 'n'
+            return "n"
         if type_code in _DATE_CODES:
-            return 'd'
-        return 's'
+            return "d"
+        return "s"
 
-with_system_flag=0
+
+with_system_flag = 0
 
 # Number of retries in the firebirdsql query loop.
 # Covers brief outages during a Firebird server restart.
@@ -135,12 +149,12 @@ _FIREBIRD_DRIVER_RETRY_DELAY = 0.5  # seconds
 # gds_codes (e.g. Python-level socket errors raised before the
 # server could return a status vector).
 _RECONNECT_MARKERS = (
-    'broken pipe',
-    'connection lost',
-    'connection closed',
-    'network error',
-    'too many open handles',
-    'shutdown',
+    "broken pipe",
+    "connection lost",
+    "connection closed",
+    "network error",
+    "too many open handles",
+    "shutdown",
 )
 
 
@@ -150,7 +164,7 @@ def _is_firebird_driver_connection_lost(exc):
     # BrokenPipeError is a subclass of ConnectionError.
     if isinstance(exc, (ConnectionError, InterfaceError)):
         return True
-    codes = getattr(exc, 'gds_codes', None) or ()
+    codes = getattr(exc, "gds_codes", None) or ()
     if any(c in RECONNECT_GDS_CODES for c in codes):
         return True
     msg = str(exc).lower()
@@ -173,7 +187,8 @@ def _caller_is_manager():
     """
     try:
         from AccessControl import getSecurityManager
-        return getSecurityManager().getUser().has_role(('Manager',))
+
+        return getSecurityManager().getUser().has_role(("Manager",))
     except Exception:
         # Outside a Zope request (unit test, startup) be conservative:
         # no SQL in errors.
@@ -190,37 +205,31 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
     public-facing page do not leak SQL that may contain concatenated
     user input.
     """
-    parts = ['Firebird query failed.']
+    parts = ["Firebird query failed."]
 
     orig = str(exc).strip()
     if orig:
-        parts.append('')
-        parts.append('Error:')
-        parts.append(orig)
+        parts.append(f"Error: {orig.replace(chr(10), '<br/>')}")
 
-    sqlstate = getattr(exc, 'sqlstate', None)
+    sqlstate = getattr(exc, "sqlstate", None)
     if sqlstate:
         if isinstance(sqlstate, bytes):
-            sqlstate = sqlstate.decode('ascii', 'replace')
-        parts.append(f'SQLSTATE: {sqlstate}')
+            sqlstate = sqlstate.decode("ascii", "replace")
+        parts.append(f"SQLSTATE: {sqlstate}")
 
-    sqlcode = getattr(exc, 'sqlcode', None)
+    sqlcode = getattr(exc, "sqlcode", None)
     if sqlcode is not None:
-        parts.append(f'SQLCODE: {sqlcode}')
+        parts.append(f"SQLCODE: {sqlcode}")
 
     if query_string and include_sql:
         snippet = query_string.strip()
         max_len = 2000
         if len(snippet) > max_len:
-            snippet = snippet[:max_len] + '\n  ... (truncated)'
-        parts.append('')
-        parts.append('SQL:')
-        parts.append(snippet)
-    elif query_string:
-        parts.append('')
-        parts.append('SQL: <hidden — caller lacks Manager role>')
+            snippet = snippet[:max_len] + "\n  ... (truncated)"
+        parts.append(f"SQL: {snippet}")
 
-    return '<br/>'.join(parts)
+    return "<br/>".join(parts)
+
 
 def fetchallmap(c):
     """Fetch all rows from cursor c as a list of {column_name: value} dicts.
@@ -242,34 +251,28 @@ def fetchallmap(c):
         r.append(d)
     return r
 
+
 def _convert_dsn(dsn):
     """Convert firebirdsql DSN format to firebird-driver format.
 
-    firebirdsql:      host:port/path  host:/path  host/path
-    firebird-driver:  host/port:path  host:/path  host:path
+    firebirdsql:      host:port/path  host:/path
+    firebird-driver:  host/port:path  host:path
     """
-    # host:port/path -> host/port:path
-    m = re.match(r'^([^:/]+):(\d+)/(.+)$', dsn)
-    if m:
-        return f'{m.group(1)}/{m.group(2)}:{m.group(3)}'
-    # host:/path
-    m = re.match(r'^([^:/]+):/(.+)$', dsn)
-    if m:
-        path = m.group(2)
-        if '/' not in path:
-            # single component like host:/alias -> host:alias
-            return f'{m.group(1)}:{path}'
-        return dsn
-    # host/path -> host:path
-    m = re.match(r'^([^:/]+)/(.+)$', dsn)
-    if m:
-        return f'{m.group(1)}:{m.group(2)}'
-    return dsn
+    m = re.match(r"^([^:/]+)(?::(\d+))?[:/](.+)$", dsn)
+    if not m:
+        raise ValueError(f"Unrecognized DSN format: {dsn!r}")
+    host, port, path = m.groups()
+    if port:
+        return f"{host}/{port}:{path}"
+    # /alias (single component) -> alias; /path/to/db stays as-is
+    if path.startswith("/") and "/" not in path[1:]:
+        path = path[1:]
+    return f"{host}:{path}"
 
 
 class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
-    database_error=Error
-    opened=None
+    database_error = Error
+    opened = None
 
     conn = None
 
@@ -277,11 +280,13 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         if self.conn is not None:
             self.close()
         self.conn = _connect(**self.conn_args)
-        if _DRIVER == 'firebirdsql':
+        if _DRIVER == "firebirdsql":
             self.conn.set_autocommit(True)
         else:
-            self.conn.main_transaction.default_tpb = _make_tpb(_Isolation.READ_COMMITTED)
-        self.opened=DateTime()
+            self.conn.main_transaction.default_tpb = _make_tpb(
+                _Isolation.READ_COMMITTED
+            )
+        self.opened = DateTime()
 
     def close(self):
         conn = self.conn
@@ -292,12 +297,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         with contextlib.suppress(Exception):
             conn.close()
 
-    def __init__(self,connection):
-        conn_args = dict(
-            s.split('=', 1) for s in connection.split()
-        )
-        if _DRIVER == 'firebird-driver' and 'dsn' in conn_args:
-            conn_args['database'] = _convert_dsn(conn_args.pop('dsn'))
+    def __init__(self, connection):
+        conn_args = dict(s.split("=", 1) for s in connection.split())
+        if _DRIVER == "firebird-driver" and "dsn" in conn_args:
+            conn_args["database"] = _convert_dsn(conn_args.pop("dsn"))
         self.conn_args = conn_args
         self.open()
 
@@ -317,32 +320,32 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 query_string = translated
         c = self.conn.cursor()
         try:
-            queries=[q for q in (s.strip() for s in query_string.split('\0')) if q]
+            queries = [q for q in (s.strip() for s in query_string.split("\0")) if q]
             if not queries:
-                raise OperationalError('empty query')
-            desc=None
-            result=[]
+                raise OperationalError("empty query")
+            desc = None
+            result = []
             for qs in queries:
                 c.execute(qs)
 
-                d=c.description
+                d = c.description
                 if d is None:
                     continue
-                if desc is None: desc=d
+                if desc is None:
+                    desc = d
                 elif d != desc:
                     raise OperationalError(
-                        'Multiple incompatible selects in '
-                        'multiple sql-statement query'
-                        )
+                        "Multiple incompatible selects in multiple sql-statement query"
+                    )
                 if len(result) < max_rows:
-                    r = c.fetchmany(max_rows-len(result))
+                    r = c.fetchmany(max_rows - len(result))
                     if r:
                         result += r
         finally:
             with contextlib.suppress(Exception):
                 c.close()
 
-        if _DRIVER == 'firebird-driver':
+        if _DRIVER == "firebird-driver":
             # Commit so the next query gets a fresh READ_COMMITTED
             # snapshot. Not needed for firebirdsql (autocommit is on).
             self.conn.commit()
@@ -350,20 +353,22 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         if desc is None:
             return (), ()
 
-        items=[]
+        items = []
         for name, type_code, width, ds, p, scale, null_ok in desc:
-            items.append({
-                'name': name,
-                'type': _zrdb_type(type_code, scale),
-                'width': width,
-                'null': null_ok,
-                })
+            items.append(
+                {
+                    "name": name,
+                    "type": _zrdb_type(type_code, scale),
+                    "width": width,
+                    "null": null_ok,
+                }
+            )
 
         return items, result
 
     def query(self, query_string, max_rows=9999999):
         """Public entry point — dispatch to the active driver backend."""
-        if _DRIVER == 'firebirdsql':
+        if _DRIVER == "firebirdsql":
             return self._query_firebirdsql(query_string, max_rows)
         return self._query_firebird_driver(query_string, max_rows)
 
@@ -381,15 +386,17 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
 
             except OperationalError as e:
                 last_exc = e
-                if e and e.args[0] in ('Can not recv() packets',
+                if e and e.args[0] in (
+                    "Can not recv() packets",
                     # these error only occurs very briefly
                     # after the firebird server is restarted
                     # soon thereafter, there will be a broken pipe error
-                    '_op_allocate_statement() Invalid db handle'):
+                    "_op_allocate_statement() Invalid db handle",
+                ):
                     time.sleep(1)
                     self.close()
                     self.open()
-                elif e and 'too many open handles to database' in e.args[0]:
+                elif e and "too many open handles to database" in e.args[0]:
                     self.close()
                     self.open()
                 else:
@@ -399,8 +406,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 self.close()
                 self.open()
         raise OperationalError(
-            f'Firebird query failed after {_FIREBIRDSQL_RETRIES} '
-            f'retries: {last_exc}'
+            f"Firebird query failed after {_FIREBIRDSQL_RETRIES} retries: {last_exc}"
         ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
@@ -424,8 +430,8 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     # __cause__. SQL snippet is only included for
                     # Manager-level callers — see _caller_is_manager.
                     msg = _format_firebird_driver_error(
-                        e, query_string,
-                        include_sql=_caller_is_manager())
+                        e, query_string, include_sql=_caller_is_manager()
+                    )
                     raise OperationalError(msg) from e
                 last_exc = e
                 self.close()
@@ -435,9 +441,11 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         # All retries exhausted: enrich the last connection error too,
         # so the user gets the same informative diagnosis instead of a
         # generic "server not available".
-        msg = ('Connection to Firebird lost; reconnect attempts '
-               'exhausted.\n\n' +
-               _format_firebird_driver_error(
-                   last_exc, query_string,
-                   include_sql=_caller_is_manager()))
+        msg = (
+            "Connection to Firebird lost; reconnect attempts "
+            "exhausted.\n\n"
+            + _format_firebird_driver_error(
+                last_exc, query_string, include_sql=_caller_is_manager()
+            )
+        )
         raise OperationalError(msg) from last_exc
