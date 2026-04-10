@@ -6,9 +6,8 @@ Changelog
 
 Python 3.11+ modernisation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Require Python 3.11 or newer (``python_requires='>=3.11'``) and add
-  matching trove classifiers.
-- Replace ``%``-formatting with f-strings throughout ``db.py`` and ``DA.py``.
+- Require Python 3.11 or newer.
+- Replace ``%``-formatting with f-strings.
 - Replace ``try/except Exception: pass`` with ``contextlib.suppress`` in
   ``DB.close`` and the cursor cleanup in ``_execute_query``.
 - Rewrite ``fetchallmap`` to iterate via ``zip(desc, row)`` instead of
@@ -23,9 +22,11 @@ Python 3.11+ modernisation
 - ``setup.py``: read ``README.rst`` / ``CHANGES.rst`` via
   ``pathlib.Path.read_text`` with an explicit UTF-8 encoding instead of
   bare ``open().read()``.
-- Translate all remaining German comments and docstrings in ``db.py`` to
-  English and unify the docstring/comment style (one-line docstrings
+- Unify the docstring/comment style (one-line docstrings
   stating *what*, inline comments explaining *why*).
+- Extract ISQL meta command translation (constants, regex, SQL templates
+  and ``translate_isql_meta()``) from ``db.py`` into a dedicated
+  ``isql_meta`` module, following the same pattern as ``gds_codes``.
 
 Driver support
 ~~~~~~~~~~~~~~
