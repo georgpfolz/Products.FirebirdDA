@@ -1,8 +1,8 @@
 Changelog
 =========
 
-0.8.0 (2026-04-09)
-------------------
+Unreleased
+----------
 
 Python 3.11+ modernisation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -16,19 +16,23 @@ Python 3.11+ modernisation
 Driver support
 ~~~~~~~~~~~~~~
 - Add support for ``firebird-driver`` as alternative to ``firebirdsql``.
-- Add ``gds_codes`` module for connection-loss detection with the
-  ``firebird-driver`` backend.
+
+Bug fixes
+~~~~~~~~~
+- Fix broken ZRDB type mapping for cursor.description type codes.
+- Fix DTML crash on ``firebird-driver`` errors.
+- Fix Test tab showing wrong connection status.
 
 Reliability
 ~~~~~~~~~~~
 - Simplify connection retry logic and improve error resilience.
 - Raise ``OperationalError`` when retries are exhausted instead of
   silently failing.
+- Guarantee cursor cleanup by splitting ``query()`` per driver.
 
 Error reporting
 ~~~~~~~~~~~~~~~
-- Enrich ``firebird-driver`` errors with GDS codes, SQLSTATE, SQLCODE and
-  SQL snippet.
+- Format ``firebird-driver`` error messages for HTML display.
 - Add ISQL ``show`` meta commands in the Test tab.
 
 Security
