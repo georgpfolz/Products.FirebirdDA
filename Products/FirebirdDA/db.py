@@ -184,6 +184,14 @@ def _caller_is_manager():
         return False
 
 
+def _format_firebirdsql_error(exc):
+    """Format a firebirdsql exception as an HTML-safe error message."""
+    msg = str(getattr(exc, "args", ("",))[0]).replace("\n", "<br/>")
+    op = OperationalError(msg)
+    op.args = (msg,)
+    return op
+
+
 def _format_firebird_driver_error(exc, query_string, include_sql=False):
     """Format a firebird-driver exception as a multi-line message."""
     parts = ["Firebird query failed."]
@@ -354,25 +362,31 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
 
             except OperationalError as e:
                 last_exc = e
-                if e and e.args[0] in (
+                msg = str(e.args[0])
+                if msg in (
                     "Can not recv() packets",
                     "_op_allocate_statement() Invalid db handle",
                 ):
                     time.sleep(1)
                     self.close()
                     self.open()
-                elif e and "too many open handles to database" in e.args[0]:
+                elif "too many open handles to database" in msg:
                     self.close()
                     self.open()
                 else:
-                    raise OperationalError(str(e)) from e
+                    raise _format_firebirdsql_error(e) from e
+            except Error as e:
+                raise _format_firebirdsql_error(e) from e
             except BrokenPipeError as e:
                 last_exc = e
                 self.close()
                 self.open()
-        raise OperationalError(
-            f"Firebird query failed after {_FIREBIRDSQL_RETRIES} retries: {last_exc}"
-        ) from last_exc
+        exc = _format_firebirdsql_error(last_exc)
+        exc.args = (
+            f"Firebird query failed after {_FIREBIRDSQL_RETRIES} retries: "
+            + exc.args[0],
+        )
+        raise exc from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
         """Run query via firebird-driver with retry and error enrichment."""
