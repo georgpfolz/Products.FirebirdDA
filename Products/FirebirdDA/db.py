@@ -69,7 +69,7 @@ _FIREBIRDSQL_RETRIES = 5
 
 # firebird-driver query loop: how many attempts and how long to wait
 # between them when a transient connection-loss is detected.
-_FIREBIRD_DRIVER_RETRIES = 2
+_FIREBIRD_DRIVER_RETRIES = 2  # must be >= 1
 _FIREBIRD_DRIVER_RETRY_DELAY = 0.5  # seconds
 
 # Substring fallback markers (lower-cased) used to recognise
@@ -360,12 +360,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         """Run query via firebird-driver with enrichment of error messages.
 
         Includes a retry loop for transient connection-loss situations.
-        _FIREBIRD_DRIVER_RETRIES must be >= 1; a zero value would skip
-        the loop entirely and produce a confusing "raise ... from None".
         """
-        if _FIREBIRD_DRIVER_RETRIES < 1:
-            raise OperationalError(
-                '_FIREBIRD_DRIVER_RETRIES must be >= 1')
         last_exc = None
         for attempt in range(_FIREBIRD_DRIVER_RETRIES):
             try:
