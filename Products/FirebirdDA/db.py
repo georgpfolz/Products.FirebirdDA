@@ -129,8 +129,6 @@ elif _DRIVER == "firebirdsql":
         return "s"
 
 
-with_system_flag = 0
-
 _FIREBIRDSQL_RETRIES = 5
 _FIREBIRD_DRIVER_RETRIES = 2
 _FIREBIRD_DRIVER_RETRY_DELAY = 0.5
