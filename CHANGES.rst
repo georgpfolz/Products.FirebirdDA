@@ -16,12 +16,7 @@ Python 3.11+ modernisation
 Driver support
 ~~~~~~~~~~~~~~
 - Add support for ``firebird-driver`` as alternative to ``firebirdsql``.
-
-Bug fixes
-~~~~~~~~~
-- Fix broken ZRDB type mapping for cursor.description type codes.
-- Fix DTML crash on ``firebird-driver`` errors.
-- Fix Test tab showing wrong connection status.
+- Automatic DSN format conversion between drivers.
 
 Reliability
 ~~~~~~~~~~~
@@ -33,7 +28,14 @@ Reliability
 Error reporting
 ~~~~~~~~~~~~~~~
 - Format ``firebird-driver`` error messages for HTML display.
-- Add ISQL ``show`` meta commands in the Test tab.
+
+ZMI enhancements
+~~~~~~~~~~~~~~~~
+- Add ISQL ``show`` meta commands in the Test tab
+  (``show tables``, ``show table NAME``, ``show views``,
+  ``show version``, ``show database``).
+- Show connection status in the object listing.
+- Include SQL snippet in error messages for Manager callers.
 
 Security
 ~~~~~~~~
