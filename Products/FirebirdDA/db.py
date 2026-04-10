@@ -40,7 +40,18 @@ if _DRIVER == 'firebird-driver':
     from firebird.driver import InterfaceError
     from firebird.driver import tpb as _make_tpb
     from firebird.driver.types import Isolation as _Isolation
-    from .gds_codes import RECONNECT_GDS_CODES, gds_name
+    # GDS codes that indicate a lost or unusable connection where
+    # a reconnect + retry is appropriate.
+    RECONNECT_GDS_CODES: frozenset[int] = frozenset({
+        335544648,   # connection lost to database (pipe)
+        335544721,   # network error
+        335544722,   # Unable to complete network request
+        335544726,   # Error reading data from the connection
+        335544727,   # Error writing data to the connection
+        335544741,   # connection lost to database
+        335544761,   # too many open handles to database
+        335544856,   # connection shutdown
+    })
 
     class OperationalError(Exception):
         """FirebirdDA operational error for the firebird-driver backend.
@@ -172,8 +183,8 @@ def _caller_is_manager():
 def _format_firebird_driver_error(exc, query_string, include_sql=False):
     """Format a firebird-driver exception as a multi-line message.
 
-    Includes the driver message, GDS codes, SQLSTATE, SQLCODE and
-    optionally the SQL text.  include_sql is gated by
+    Includes the driver message, SQLSTATE, SQLCODE and optionally the
+    SQL text.  include_sql is gated by
     _caller_is_manager() at the call site: non-Manager callers get a
     placeholder instead of the query text, so errors bubbling into a
     public-facing page do not leak SQL that may contain concatenated
@@ -186,15 +197,6 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
         parts.append('')
         parts.append('Error:')
         parts.append(orig)
-
-    codes = getattr(exc, 'gds_codes', None) or ()
-    if codes:
-        formatted = []
-        for c in codes:
-            name = gds_name(c)
-            formatted.append(f'{c} ({name})' if name else str(c))
-        parts.append('')
-        parts.append(f"GDS codes: {', '.join(formatted)}")
 
     sqlstate = getattr(exc, 'sqlstate', None)
     if sqlstate:
@@ -218,7 +220,7 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
         parts.append('')
         parts.append('SQL: <hidden — caller lacks Manager role>')
 
-    return '\n'.join(parts)
+    return '<br/>'.join(parts)
 
 def fetchallmap(c):
     """Fetch all rows from cursor c as a list of {column_name: value} dicts.
@@ -417,7 +419,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 if not _is_firebird_driver_connection_lost(e):
                     # SQL / logic error: enrich and re-raise so the
                     # user sees the offending SQL plus driver context
-                    # (GDS codes, SQLSTATE, SQLCODE) in the ZMI Test
+                    # (SQLSTATE, SQLCODE) in the ZMI Test
                     # tab. The original exception is chained via
                     # __cause__. SQL snippet is only included for
                     # Manager-level callers — see _caller_is_manager.
