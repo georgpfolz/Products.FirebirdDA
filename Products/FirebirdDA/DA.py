@@ -40,7 +40,7 @@ def manage_addFirebirdConnection(
         return self.manage_main(self,REQUEST)
 
 class Connection(Shared.DC.ZRDB.Connection.Connection):
-    " "
+    """Zope ZRDB Connection for Interbase/Firebird databases."""
     database_type=database_type
     driver_name=_DRIVER
     _isAnSQLConnection = True

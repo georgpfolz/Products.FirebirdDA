@@ -40,18 +40,20 @@ if _DRIVER == 'firebird-driver':
     from firebird.driver.types import Isolation as _Isolation
     from .gds_codes import RECONNECT_GDS_CODES, gds_name
 
-    # Custom OperationalError class that does NOT inherit from
-    # firebird.base.types.Error. firebird.base.types.Error defines
-    # __getattr__ such that any unset attribute returns None — including
-    # __call__. This crashes Zope's DocumentTemplate: safe_callable()
-    # checks hasattr(e, '__call__') (which returns True) and then calls
-    # e() on the exception instance. Since e.__call__ is None, rendering
-    # <dtml-var error_value> in the ZMI Test tab crashes with
-    # "TypeError: 'NoneType' object is not callable" — without the
-    # actual Firebird error message ever reaching the user.
-    # The original firebird-driver exception is chained via __cause__.
     class OperationalError(Exception):
-        """FirebirdDA operational error for the firebird-driver backend."""
+        """FirebirdDA operational error for the firebird-driver backend.
+
+        Does NOT inherit from firebird.base.types.Error, because that class
+        defines __getattr__ such that any unset attribute returns None —
+        including __call__.  This crashes Zope's DocumentTemplate:
+        safe_callable() checks hasattr(e, '__call__') (which returns True)
+        and then calls e() on the exception instance.  Since e.__call__ is
+        None, rendering <dtml-var error_value> in the ZMI Test tab crashes
+        with "TypeError: 'NoneType' object is not callable" — without the
+        actual Firebird error message ever reaching the user.
+
+        The original firebird-driver exception is chained via __cause__.
+        """
         pass
 elif _DRIVER == 'firebirdsql':
     import firebirdsql
@@ -98,17 +100,19 @@ def _is_firebird_driver_connection_lost(exc):
 
 
 def _caller_is_manager():
-    """True if the current Zope user has the Manager role."""
-    # Gates two Manager-only conveniences in this DA: including the
-    # offending SQL snippet in error messages, and translating ISQL
-    # meta commands (show tables / show table NAME / ...) into
-    # system-table queries in _execute_query. Non-Manager callers get
-    # sanitised errors without SQL and see meta commands passed
-    # through to Firebird as-is (producing a normal parse error).
-    #
-    # Uses has_role(('Manager',)) instead of checkPermission because
-    # checkPermission needs an Acquisition-wrapped context object,
-    # which the DB instance does not have.
+    """True if the current Zope user has the Manager role.
+
+    Gates two Manager-only conveniences in this DA: including the
+    offending SQL snippet in error messages, and translating ISQL
+    meta commands (show tables / show table NAME / ...) into
+    system-table queries in _execute_query.  Non-Manager callers get
+    sanitised errors without SQL and see meta commands passed
+    through to Firebird as-is (producing a normal parse error).
+
+    Uses has_role(('Manager',)) instead of checkPermission because
+    checkPermission needs an Acquisition-wrapped context object,
+    which the DB instance does not have.
+    """
     try:
         from AccessControl import getSecurityManager
         return getSecurityManager().getUser().has_role(('Manager',))
@@ -119,12 +123,15 @@ def _caller_is_manager():
 
 
 def _format_firebird_driver_error(exc, query_string, include_sql=False):
-    """Format a firebird-driver exception as a multi-line message
-    (driver message, GDS codes, SQLSTATE, SQLCODE, optional SQL)."""
-    # include_sql is gated by _caller_is_manager() at the call site:
-    # non-Manager callers get a placeholder instead of the query text,
-    # so errors bubbling into a public-facing page do not leak SQL
-    # that may contain concatenated user input.
+    """Format a firebird-driver exception as a multi-line message.
+
+    Includes the driver message, GDS codes, SQLSTATE, SQLCODE and
+    optionally the SQL text.  include_sql is gated by
+    _caller_is_manager() at the call site: non-Manager callers get a
+    placeholder instead of the query text, so errors bubbling into a
+    public-facing page do not leak SQL that may contain concatenated
+    user input.
+    """
     parts = ['Firebird query failed.']
 
     orig = str(exc).strip()
@@ -242,13 +249,15 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.open()
 
     def _execute_query(self, query_string, max_rows):
-        """Execute query_string on self.conn and return (items, rows)."""
-        # Translate ISQL meta commands (show tables, show version, ...)
-        # into real Firebird system queries so they work the same in
-        # the Zope Test tab as in isql. Manager callers only — same
-        # policy as the SQL-in-error-message logic. Non-Manager callers
-        # see the query unchanged and get a normal Firebird parse
-        # error, just like before the ISQL meta translation existed.
+        """Execute query_string on self.conn and return (items, rows).
+
+        Translates ISQL meta commands (show tables, show version, ...)
+        into real Firebird system queries so they work the same in the
+        Zope Test tab as in isql.  Manager callers only — same policy
+        as the SQL-in-error-message logic.  Non-Manager callers see
+        the query unchanged and get a normal Firebird parse error,
+        just like before the ISQL meta translation existed.
+        """
         if _caller_is_manager():
             translated = translate_isql_meta(query_string)
             if translated is not None:
@@ -312,10 +321,12 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         return self._query_firebird_driver(query_string, max_rows)
 
     def _query_firebirdsql(self, query_string, max_rows):
-        """Run query via firebirdsql with retries for transient errors."""
-        # Retries cover broken pipe, invalid db handle and recv()
-        # packet problems that occur briefly when the Firebird server
-        # is restarted.
+        """Run query via firebirdsql with retries for transient errors.
+
+        Retries cover broken pipe, invalid db handle and recv() packet
+        problems that occur briefly when the Firebird server is
+        restarted.
+        """
         last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
             try:
@@ -346,10 +357,12 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
-        """Run query via firebird-driver with enrichment of error messages."""
-        # Defensive: range(0) would skip the loop entirely and leave
-        # last_exc as None, which would lead to a confusing
-        # "raise ... from None". Treat misconfiguration as error.
+        """Run query via firebird-driver with enrichment of error messages.
+
+        Includes a retry loop for transient connection-loss situations.
+        _FIREBIRD_DRIVER_RETRIES must be >= 1; a zero value would skip
+        the loop entirely and produce a confusing "raise ... from None".
+        """
         if _FIREBIRD_DRIVER_RETRIES < 1:
             raise OperationalError(
                 '_FIREBIRD_DRIVER_RETRIES must be >= 1')

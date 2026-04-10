@@ -123,9 +123,13 @@ SHOW_TABLE_RE = re.compile(
 
 
 def translate_isql_meta(query_string):
-    """If query_string matches a known ISQL meta command
+    """Translate an ISQL meta command to a Firebird SQL query.
+
+    If query_string matches a known ISQL meta command
     (case-insensitive, whitespace normalised, optional trailing ';'),
-    return the corresponding Firebird SQL query. Otherwise None."""
+    return the corresponding Firebird SQL query.  Otherwise return
+    None.
+    """
     stripped = query_string.strip()
     # 1) Exact matches (show tables / show version / ...)
     key = ' '.join(stripped.rstrip(';').strip().lower().split())
