@@ -174,7 +174,12 @@ def _format_firebird_driver_error(exc, query_string, include_sql=False):
     return '\n'.join(parts)
 
 def fetchallmap(c):
-    """Fetch all rows from cursor c as a list of {column_name: value} dicts."""
+    """Fetch all rows from cursor c as a list of {column_name: value} dicts.
+
+    Not called anywhere in this product and not exposed to Zope.
+    Kept for backward compatibility with third-party code that may
+    import it directly.
+    """
     desc = c.description
     r = []
     for row in c.fetchall():
