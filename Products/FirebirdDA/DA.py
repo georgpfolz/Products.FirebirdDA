@@ -20,7 +20,7 @@ from App.special_dtml import HTMLFile
 addConnectionForm=HTMLFile('dtml/connectionAdd',globals())
 
 
-def manage_addFirebirdConnectionForm(self, REQUEST, *args, **kw):
+def manage_addFirebirdConnectionForm(self, REQUEST):
     """Add a connection form"""
     return addConnectionForm(
         self, self, REQUEST,

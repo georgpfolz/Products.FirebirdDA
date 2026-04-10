@@ -2,7 +2,7 @@ from pathlib import Path
 
 from setuptools import setup, find_packages
 
-version = '0.8.0'
+version = '0.7.1'
 
 here = Path(__file__).parent
 long_description = (
