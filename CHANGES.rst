@@ -7,57 +7,35 @@ Changelog
 Python 3.11+ modernisation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 - Require Python 3.11 or newer.
-- Replace ``%``-formatting with f-strings.
-- Replace ``try/except Exception: pass`` with ``contextlib.suppress`` in
-  ``DB.close`` and the cursor cleanup in ``_execute_query``.
-- Rewrite ``fetchallmap`` to iterate via ``zip(desc, row)`` instead of
-  ``range(len(desc))``.
-- Build ``conn_args`` in ``DB.__init__`` via a dict comprehension.
-- Chain the re-raised ``OperationalError`` in the ``firebirdsql`` retry
-  loop via ``raise ... from e`` for correct tracebacks.
-- Rename the ``type`` loop variable in ``_execute_query`` to ``type_`` to
-  stop shadowing the builtin.
-- Remove the unused ``_IDENT_RE`` regex, the duplicated ``import re``
-  inside ``_convert_dsn`` and an unused ``import sys`` in ``DA.py``.
-- ``setup.py``: read ``README.rst`` / ``CHANGES.rst`` via
-  ``pathlib.Path.read_text`` with an explicit UTF-8 encoding instead of
-  bare ``open().read()``.
-- Unify the docstring/comment style (one-line docstrings
-  stating *what*, inline comments explaining *why*).
-- Extract ISQL meta command translation (constants, regex, SQL templates
-  and ``translate_isql_meta()``) from ``db.py`` into a dedicated
-  ``isql_meta`` module, following the same pattern as ``gds_codes``.
+- Code style: f-strings, ``contextlib.suppress``, proper exception
+  chaining, remove unused imports and dead code.
+- Unify docstring/comment style across the codebase.
+- Extract ISQL meta command translation into a dedicated ``isql_meta``
+  module.
 
 Driver support
 ~~~~~~~~~~~~~~
-- Add support for ``firebird-driver`` as alternative to ``firebirdsql``,
-  selectable via the ``FIREBIRDDA_DRIVER`` environment variable. Uses
-  READ_COMMITTED TPB with an explicit ``commit()`` after each query to
-  guarantee a fresh snapshot for the next query. [11228eb]
-- Add ``gds_codes`` module with symbolic constants for the most relevant
-  Firebird GDS codes and a ``RECONNECT_GDS_CODES`` set used by the
-  ``firebird-driver`` path to detect connection loss. [11228eb]
+- Add support for ``firebird-driver`` as alternative to ``firebirdsql``.
+- Add ``gds_codes`` module for connection-loss detection with the
+  ``firebird-driver`` backend.
 
 Reliability
 ~~~~~~~~~~~
-- Simplify connection retry logic and improve error resilience. [cba035f]
-- Raise ``OperationalError`` when ``firebirdsql`` retries are exhausted
-  instead of silently failing. [6231ee0]
-- Replace bare ``except`` in ``fetchallmap`` with ``AttributeError``.
-  [0ce656a]
+- Simplify connection retry logic and improve error resilience.
+- Raise ``OperationalError`` when retries are exhausted instead of
+  silently failing.
 
 Error reporting
 ~~~~~~~~~~~~~~~
 - Enrich ``firebird-driver`` errors with GDS codes, SQLSTATE, SQLCODE and
-  SQL snippet. [a9c7afd]
-- Add ISQL ``show`` meta commands in the Test tab. [e7cf6c7]
+  SQL snippet.
+- Add ISQL ``show`` meta commands in the Test tab.
 
 Security
 ~~~~~~~~
-- Remove unused ``_connections`` cache that held plaintext credentials.
-  [ac00513]
-- Hide SQL snippet in errors for non-Manager callers. [c13d3ce]
-- Restrict ISQL meta command translation to Manager callers. [9373211]
+- Remove unused connection cache that held plaintext credentials.
+- Restrict SQL snippets in error messages to Manager callers.
+- Restrict ISQL meta commands to Manager callers.
 
 0.7.1 (2024-01-04)
 ------------------
