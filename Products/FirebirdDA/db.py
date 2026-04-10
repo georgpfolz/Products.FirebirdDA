@@ -22,13 +22,9 @@ from DateTime import DateTime
 
 from .isql_meta import translate_isql_meta
 
-# Driver selection via environment variable FIREBIRDDA_DRIVER
-# Supported values: 'firebirdsql', 'firebird-driver'
-# If not set: auto-detect (firebirdsql preferred for backwards compatibility)
 _DRIVER = os.environ.get("FIREBIRDDA_DRIVER", "").strip()
 
 if not _DRIVER:
-    # Auto-detect: firebirdsql preferred for backwards compatibility
     try:
         import firebirdsql
 
@@ -135,14 +131,9 @@ elif _DRIVER == "firebirdsql":
 
 with_system_flag = 0
 
-# Number of retries in the firebirdsql query loop.
-# Covers brief outages during a Firebird server restart.
 _FIREBIRDSQL_RETRIES = 5
-
-# firebird-driver query loop: how many attempts and how long to wait
-# between them when a transient connection-loss is detected.
-_FIREBIRD_DRIVER_RETRIES = 2  # must be >= 1
-_FIREBIRD_DRIVER_RETRY_DELAY = 0.5  # seconds
+_FIREBIRD_DRIVER_RETRIES = 2
+_FIREBIRD_DRIVER_RETRY_DELAY = 0.5
 
 # Substring fallback markers (lower-cased) used to recognise
 # connection-loss situations on exceptions that do not carry
@@ -196,15 +187,7 @@ def _caller_is_manager():
 
 
 def _format_firebird_driver_error(exc, query_string, include_sql=False):
-    """Format a firebird-driver exception as a multi-line message.
-
-    Includes the driver message, SQLSTATE, SQLCODE and optionally the
-    SQL text.  include_sql is gated by
-    _caller_is_manager() at the call site: non-Manager callers get a
-    placeholder instead of the query text, so errors bubbling into a
-    public-facing page do not leak SQL that may contain concatenated
-    user input.
-    """
+    """Format a firebird-driver exception as a multi-line message."""
     parts = ["Firebird query failed."]
 
     orig = str(exc).strip()
@@ -305,15 +288,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.open()
 
     def _execute_query(self, query_string, max_rows):
-        """Execute query_string on self.conn and return (items, rows).
-
-        Translates ISQL meta commands (show tables, show version, ...)
-        into real Firebird system queries so they work the same in the
-        Zope Test tab as in isql.  Manager callers only — same policy
-        as the SQL-in-error-message logic.  Non-Manager callers see
-        the query unchanged and get a normal Firebird parse error,
-        just like before the ISQL meta translation existed.
-        """
+        """Execute query_string on self.conn and return (items, rows)."""
         if _caller_is_manager():
             translated = translate_isql_meta(query_string)
             if translated is not None:
@@ -373,12 +348,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         return self._query_firebird_driver(query_string, max_rows)
 
     def _query_firebirdsql(self, query_string, max_rows):
-        """Run query via firebirdsql with retries for transient errors.
-
-        Retries cover broken pipe, invalid db handle and recv() packet
-        problems that occur briefly when the Firebird server is
-        restarted.
-        """
+        """Run query via firebirdsql with retries for transient errors."""
         last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
             try:
@@ -388,9 +358,6 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 last_exc = e
                 if e and e.args[0] in (
                     "Can not recv() packets",
-                    # these error only occurs very briefly
-                    # after the firebird server is restarted
-                    # soon thereafter, there will be a broken pipe error
                     "_op_allocate_statement() Invalid db handle",
                 ):
                     time.sleep(1)
@@ -410,10 +377,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
-        """Run query via firebird-driver with enrichment of error messages.
-
-        Includes a retry loop for transient connection-loss situations.
-        """
+        """Run query via firebird-driver with retry and error enrichment."""
         last_exc = None
         for attempt in range(_FIREBIRD_DRIVER_RETRIES):
             try:
@@ -423,12 +387,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
 
             except (Error, ConnectionError) as e:
                 if not _is_firebird_driver_connection_lost(e):
-                    # SQL / logic error: enrich and re-raise so the
-                    # user sees the offending SQL plus driver context
-                    # (SQLSTATE, SQLCODE) in the ZMI Test
-                    # tab. The original exception is chained via
-                    # __cause__. SQL snippet is only included for
-                    # Manager-level callers — see _caller_is_manager.
+                    # SQL / logic error: enrich and re-raise.
                     msg = _format_firebird_driver_error(
                         e, query_string, include_sql=_caller_is_manager()
                     )
@@ -438,9 +397,6 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 if attempt < _FIREBIRD_DRIVER_RETRIES - 1:
                     time.sleep(_FIREBIRD_DRIVER_RETRY_DELAY)
 
-        # All retries exhausted: enrich the last connection error too,
-        # so the user gets the same informative diagnosis instead of a
-        # generic "server not available".
         msg = (
             "Connection to Firebird lost; reconnect attempts "
             "exhausted.\n\n"

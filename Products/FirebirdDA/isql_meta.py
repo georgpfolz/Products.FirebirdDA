@@ -23,9 +23,6 @@ parameterised variants (``show table NAME``) are handled by
 import re
 
 
-# ISQL meta commands that isql supports natively but Firebird SQL does
-# not. Exact matches go here; parameterised variants (show table NAME)
-# are handled in translate_isql_meta().
 ISQL_META_COMMANDS = {
     'show tables': (
         "SELECT TRIM(RDB$RELATION_NAME) AS TABLE_NAME "
