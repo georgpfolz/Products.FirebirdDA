@@ -74,6 +74,16 @@ Reliability
 - Log errors from closing a connection instead of discarding them
   silently -- a failing detach can leave the server-side attachment
   open, which matters when chasing "too many open handles".
+- Under ``firebird-driver``, abandon known-dead connections without
+  calling native ``detach`` (null the attachment handle after
+  best-effort local cleanup).  ``libfbclient`` has been observed to
+  raise SIGILL inside ``YAttachment::detach`` on dead attachments,
+  which kills the whole Zope process; a lingering server attachment
+  is preferable.  Normal ``close()`` (ZMI, reopen of a live handle)
+  still detaches cleanly.  ``firebirdsql`` is unchanged.
+- Reopen when the driver handle is already closed but still referenced
+  (``conn.is_closed()``), so a stale ``self.conn`` does not fail queries
+  with opaque ``TypeError``/``AttributeError`` instead of reconnecting.
 
 Error reporting
 ~~~~~~~~~~~~~~~
