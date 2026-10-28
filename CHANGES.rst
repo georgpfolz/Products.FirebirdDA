@@ -74,6 +74,26 @@ Reliability
 - Log errors from closing a connection instead of discarding them
   silently -- a failing detach can leave the server-side attachment
   open, which matters when chasing "too many open handles".
+- Under ``firebird-driver``, ``close()`` never calls native
+  ``YAttachment::detach``, neither via ``conn.close()`` nor from a
+  later ``Connection.__del__``.  ``libfbclient`` raises SIGILL inside
+  detach on a dead attachment and kills the Zope process; a ping
+  immediately before detach is not a safe gate.  Every close nulls
+  ``_att`` first and then does best-effort local cleanup only.
+  Server-side attachments may linger until Firebird's attachment
+  timeout.  ``firebirdsql`` still closes normally.
+- Serialize ``open`` / ``close`` / ``query`` on a per-``DB`` ``RLock``
+  so Waitress worker threads cannot overlap lifecycle operations on
+  the same shared connection.
+- On query failure under ``firebird-driver``, skip ``rollback()`` when
+  the error is already a connection loss (the outer retry path
+  abandons the handle; an extra native call on a dead attachment is
+  useless).
+- Treat GDS ``335544324`` (invalid database handle) and matching
+  message markers as connection loss for reconnect / abandon.
+- Reopen when the driver handle is already closed but still referenced
+  (``conn.is_closed()``), so a stale ``self.conn`` does not fail queries
+  with opaque ``TypeError``/``AttributeError`` instead of reconnecting.
 
 Error reporting
 ~~~~~~~~~~~~~~~

@@ -16,6 +16,7 @@ import decimal
 import os
 import re
 import signal
+import threading
 import time
 from logging import getLogger
 
@@ -43,7 +44,6 @@ if _DRIVER not in ("firebirdsql", "firebird-driver"):
 if _DRIVER == "firebird-driver":
     import ctypes
     import ctypes.util
-    import threading
 
     from firebird.driver import DatabaseError as Error
     from firebird.driver import InterfaceError
@@ -97,6 +97,7 @@ if _DRIVER == "firebird-driver":
     # a reconnect + retry is appropriate.
     RECONNECT_GDS_CODES: frozenset[int] = frozenset(
         {
+            335544324,  # invalid database handle (no active connection)
             335544648,  # connection lost to database (pipe)
             335544721,  # network error
             335544722,  # Unable to complete network request
@@ -238,6 +239,10 @@ _RECONNECT_MARKERS = (
     "network error",
     "too many open handles",
     "shutdown",
+    "invalid database handle",
+    "no active connection",
+    "error reading data",
+    "error writing data",
 )
 
 
@@ -414,42 +419,134 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
     conn = None
 
     def open(self):
-        if self.conn is not None:
-            self.close()
-        self.conn = _connect(**self.conn_args)
-        if _DRIVER == "firebirdsql":
-            self.conn.set_autocommit(True)
-        else:
-            self.conn.main_transaction.default_tpb = _make_tpb(
-                _Isolation.READ_COMMITTED
-            )
-        self.opened = DateTime()
+        with self._lock:
+            if self.conn is not None:
+                # Nested close under the same RLock (re-entrant).
+                self.close()
+            self.conn = _connect(**self.conn_args)
+            if _DRIVER == "firebirdsql":
+                self.conn.set_autocommit(True)
+            else:
+                self.conn.main_transaction.default_tpb = _make_tpb(
+                    _Isolation.READ_COMMITTED
+                )
+            self.opened = DateTime()
 
-    def close(self):
-        conn = self.conn
-        self.conn = None
-        self.opened = None
-        if conn is None:
-            return
-        try:
-            conn.close()
-        except Exception:
-            # Never propagate: close() runs inside error handlers and
-            # retry paths, where a raised close error would mask the
-            # original exception. Log it instead -- a failing detach can
-            # leave the server-side attachment open, which matters when
-            # chasing "too many open handles".
-            LOG.warning("Error closing the Firebird connection.", exc_info=True)
+    def _ensure_open(self):
+        """Reopen if we have no connection or a stale closed driver handle.
+
+        ``firebird-driver`` can leave ``self.conn`` set while
+        ``conn.is_closed()`` is already true (e.g. something else closed
+        the handle, or a prior abandon nulled ``_att`` without clearing
+        our reference).  Using that object then raises opaque
+        ``TypeError``/``AttributeError`` instead of a connection-loss
+        error, so the retry path never runs.  Detect and reopen first.
+
+        Caller must hold ``self._lock`` (query/open paths do).
+        """
+        if self.conn is not None:
+            is_closed = getattr(self.conn, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                self.conn = None
+                self.opened = None
+        if self.opened is None:
+            self.open()
+
+    def close(self, *, abandon=False):
+        """Release the Firebird connection held by this ``DB`` instance.
+
+        Always clears ``self.conn`` / ``self.opened`` first so a second
+        ``close()`` is a no-op and concurrent retry logic cannot see a
+        half-closed handle.
+
+        Under ``firebird-driver`` this method **never** calls native
+        ``YAttachment::detach`` (via ``conn.close()`` or GC ``__del__``).
+        ``libfbclient`` has been observed to raise **SIGILL** inside
+        detach on dead or inconsistent attachments and kill the whole
+        Zope process.  Even a successful ``ping()`` is not a reliable
+        gate (TOCTOU / threads).  We always null ``_att`` first
+        so ``Connection.__del__`` cannot detach, then best-effort
+        Python-side cleanup.  Server-side the attachment may linger
+        until the server times it out — preferable to a process crash.
+
+        *abandon* only changes the log reason/level (connection-loss vs
+        normal close).  ``firebirdsql`` is pure Python and keeps a
+        normal ``conn.close()``.
+        """
+        with self._lock:
+            conn = self.conn
+            self.conn = None
+            self.opened = None
+            if conn is None:
+                return
+            if _DRIVER == "firebird-driver":
+                reason = "connection-loss" if abandon else "normal-close"
+                self._abandon_firebird_driver_connection(conn, reason=reason)
+                return
+            # firebirdsql: pure Python, normal close is always safe.
+            try:
+                is_closed = getattr(conn, "is_closed", None)
+                if callable(is_closed) and is_closed():
+                    return
+                conn.close()
+            except Exception:
+                LOG.warning(
+                    "Error closing the Firebird connection.", exc_info=True
+                )
+
+    def _abandon_firebird_driver_connection(self, conn, *, reason="unknown"):
+        """Drop a firebird-driver connection without native detach.
+
+        *reason* is only for logging: ``connection-loss`` (retry/loss
+        paths) vs ``normal-close`` (ZMI, reopen, explicit close).
+        """
+        # connection-loss stays WARNING (ops signal). normal-close is
+        # DEBUG so ZMI reopen / open()→close() does not flood the event log.
+        log = LOG.warning if reason == "connection-loss" else LOG.debug
+        log(
+            "Closing firebird-driver connection without detach "
+            "(avoids libfbclient YAttachment::detach SIGILL risk). "
+            "reason=%s thread=%s conn_id=%s",
+            reason,
+            threading.current_thread().ident,
+            id(conn),
+        )
+        # Null _att FIRST so Connection.__del__ cannot detach even
+        # if best-effort cleanup below is interrupted.  firebird-driver
+        # 2.0.x: only Connection.close()/__del__ call _att.detach();
+        # _close()/_close_internals() do not detach (they roll back /
+        # close transactions and statements).
+        self._neutralize_firebird_driver_attachment(conn)
+        # Best-effort local cleanup.  With _att already None, helpers
+        # that still touch the wire fail; that is expected and suppressed.
+        with contextlib.suppress(Exception):
+            conn._close()
+        with contextlib.suppress(Exception):
+            conn._close_internals()
+
+    @staticmethod
+    def _neutralize_firebird_driver_attachment(conn):
+        """Null ``_att`` so firebird-driver will not detach in ``__del__``."""
+        with contextlib.suppress(Exception):
+            if getattr(conn, "_att", None) is not None:
+                conn._att = None
 
     def __init__(self, connection):
         conn_args = dict(s.split("=", 1) for s in connection.split())
         if _DRIVER == "firebird-driver" and "dsn" in conn_args:
             conn_args["database"] = _convert_dsn(conn_args.pop("dsn"))
         self.conn_args = conn_args
+        # Serialize open/close/query: Waitress multi-thread + shared DB
+        # connection is a documented risk; RLock also closes TOCTOU
+        # windows around native client calls.
+        self._lock = threading.RLock()
         self.open()
 
     def _execute_query(self, query_string, max_rows):
-        """Execute query_string on self.conn and return (items, rows)."""
+        """Execute query_string on self.conn and return (items, rows).
+
+        Caller must hold ``self._lock``.
+        """
         c = self.conn.cursor()
         try:
             queries = [q for q in (s.strip() for s in query_string.split("\0")) if q]
@@ -486,14 +583,18 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 # Commit so the next query gets a fresh READ_COMMITTED
                 # snapshot. Not needed for firebirdsql (autocommit is on).
                 self.conn.commit()
-        except Exception:
+        except Exception as exc:
             if _DRIVER == "firebird-driver":
                 # Rollback so the failed query does not leave an open
                 # transaction behind. Accumulated open transactions prevent
                 # the OAT from advancing, eventually triggering a server-
-                # side "connection shutdown" (GDS 335544856).
-                with contextlib.suppress(Exception):
-                    self.conn.rollback()
+                # side "connection shutdown" (GDS 335544856).  Skip the
+                # rollback when the wire is already gone — an extra native
+                # call on a dead attachment is useless, and the outer
+                # query loop will abandon the handle.
+                if not _is_firebird_driver_connection_lost(exc):
+                    with contextlib.suppress(Exception):
+                        self.conn.rollback()
             raise
         finally:
             with contextlib.suppress(Exception):
@@ -517,9 +618,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
 
     def query(self, query_string, max_rows=9999999):
         """Public entry point — dispatch to the active driver backend."""
-        if _DRIVER == "firebirdsql":
-            return self._query_firebirdsql(query_string, max_rows)
-        return self._query_firebird_driver(query_string, max_rows)
+        with self._lock:
+            if _DRIVER == "firebirdsql":
+                return self._query_firebirdsql(query_string, max_rows)
+            return self._query_firebird_driver(query_string, max_rows)
 
     def _reconnect_for_retry(self, query_string, exc, delay=0):
         """Gate a firebirdsql connection-loss retry to pure SELECT batches,
@@ -544,6 +646,15 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
             time.sleep(delay)
         self.close()
 
+    def _close_after_connection_loss(self):
+        """Drop a connection after a detected wire/attachment loss.
+
+        Under ``firebird-driver`` this *abandons* the handle (no native
+        detach) because detach on a dead attachment can SIGILL.  Under
+        ``firebirdsql`` a normal close is fine.
+        """
+        self.close(abandon=(_DRIVER == "firebird-driver"))
+
     def _query_firebirdsql(self, query_string, max_rows):
         """Run query via firebirdsql with retries for transient errors.
 
@@ -555,12 +666,9 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
             try:
-                if self.opened is None:
-                    # Reopen after an explicit close() (e.g. the ZMI
-                    # "Close Connection" button) or a failed reconnect --
-                    # firebirdsql leaves self.conn as None, so without
-                    # this guard every later query would hit None.cursor().
-                    self.open()
+                # Reopen after close() (ZMI button, reconnect) or a stale
+                # closed handle; without this, later queries hit None.cursor().
+                self._ensure_open()
                 return self._execute_query(query_string, max_rows)
 
             except OperationalError as e:
@@ -607,8 +715,7 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         last_exc = None
         for attempt in range(_FIREBIRD_DRIVER_RETRIES):
             try:
-                if self.opened is None:
-                    self.open()
+                self._ensure_open()
                 return self._execute_query(query_string, max_rows)
 
             except (Error, ConnectionError, InterfaceError) as e:
@@ -619,14 +726,15 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     # Connection lost on a batch that may write. The commit
                     # can already have reached the server before the drop,
                     # so replaying the batch risks a duplicate write --
-                    # surface the loss immediately instead. Close first so
-                    # the next request reconnects via the guard above.
-                    self.close()
+                    # surface the loss immediately instead. Abandon first so
+                    # the next request reconnects via the guard above, and
+                    # so we never detach a dead libfbclient attachment.
+                    self._close_after_connection_loss()
                     raise _operational_error(
                         e, query_string, prefix=_CONNECTION_LOST_NO_RETRY
                     ) from e
                 last_exc = e
-                self.close()
+                self._close_after_connection_loss()
                 if attempt < _FIREBIRD_DRIVER_RETRIES - 1:
                     time.sleep(_FIREBIRD_DRIVER_RETRY_DELAY)
 

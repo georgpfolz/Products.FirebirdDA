@@ -14,7 +14,7 @@
 # line, DA.py imports it for the ZMI display. Must stay ABOVE the DA
 # import -- DA.py does ``from . import __version__`` while this module
 # is still initialising.
-__version__ = '0.8.0.dev1'
+__version__ = '0.8.0'
 
 from . import DA
 
