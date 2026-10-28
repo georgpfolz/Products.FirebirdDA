@@ -13,14 +13,16 @@
 import contextlib
 import datetime
 import decimal
-import html
 import os
 import re
 import signal
 import time
+from logging import getLogger
 
 import Shared.DC.ZRDB.THUNK
 from DateTime import DateTime
+
+LOG = getLogger("FirebirdDA")
 
 _DRIVER = os.environ.get("FIREBIRDDA_DRIVER", "").strip()
 
@@ -47,6 +49,7 @@ if _DRIVER == "firebird-driver":
     from firebird.driver import InterfaceError
     from firebird.driver import connect as _raw_connect
     from firebird.driver import tpb as _make_tpb
+    from firebird.driver.core import BlobReader
     from firebird.driver.types import Isolation as _Isolation
 
     # libfbclient installs a C-level SIGTERM handler via sigaction()
@@ -108,6 +111,13 @@ if _DRIVER == "firebird-driver":
     class OperationalError(Exception):
         """FirebirdDA operational error for the firebird-driver backend.
 
+        Carries a PLAIN-TEXT message plus structured attributes
+        (``sql``, ``sqlstate``, ``sqlcode``) so the DA layer can escape
+        the message and, for Manager callers, append the SQL when it
+        renders the ZMI Test tab.  db.py itself never HTML-escapes, so
+        the shared query() path (Z SQL Methods, SiteErrorLog, event log)
+        keeps clean plain text.
+
         Does NOT inherit from firebird.base.types.Error, because that class
         defines __getattr__ such that any unset attribute returns None —
         including __call__.  This crashes Zope's DocumentTemplate:
@@ -120,7 +130,9 @@ if _DRIVER == "firebird-driver":
         The original firebird-driver exception is chained via __cause__.
         """
 
-        pass
+        sql = None
+        sqlstate = None
+        sqlcode = None
 
     # cursor.description type_code → ZRDB type character.
     # firebird-driver returns Python types (int, float, ...).
@@ -133,12 +145,34 @@ if _DRIVER == "firebird-driver":
             return "d"
         return "s"
 
+    def _materialize_row(row):
+        """Read open BLOB streams in a fetched row into memory.
+
+        firebird-driver returns BLOBs larger than ``stream_blob_threshold``
+        (default 64 KiB) as ``BlobReader`` streams bound to the current
+        transaction.  The commit that follows every query closes the
+        cursor and with it those readers, so unless we read them now Zope
+        would receive dead handles (rendered as ``<BlobReader ...>`` in
+        DTML, an AttributeError on ``.read()``).  Smaller BLOBs already
+        arrive materialised, so only ``BlobReader`` values are touched.
+        """
+        materialized = None
+        for i, value in enumerate(row):
+            if isinstance(value, BlobReader):
+                if materialized is None:
+                    materialized = list(row)
+                materialized[i] = value.read()
+        return tuple(materialized) if materialized is not None else row
+
 elif _DRIVER == "firebirdsql":
     import firebirdsql
     from firebirdsql import OperationalError
 
     _connect = firebirdsql.connect
     Error = firebirdsql.Error
+    # Subclass of firebirdsql.Error; bound here so QUERY_ERRORS below can
+    # name it for both drivers.
+    InterfaceError = firebirdsql.InterfaceError
 
     # cursor.description type_code → ZRDB type character.
     # firebirdsql returns ISC numeric type codes.
@@ -180,6 +214,15 @@ elif _DRIVER == "firebirdsql":
         return "s"
 
 
+# Exception types query() may raise, for callers (the DA layer) that want
+# to catch driver errors narrowly -- without swallowing ZODB ConflictError
+# or Retry, which must propagate. Error covers firebirdsql's original
+# types passed through by P3-3 (IntegrityError, ProgrammingError, ...).
+# firebird-driver's InterfaceError is a SIBLING of DatabaseError (both
+# derive from firebird.base.types.Error), so it must be listed explicitly
+# -- it reaches the DA layer raw from connect-time failures.
+QUERY_ERRORS = (OperationalError, Error, InterfaceError)
+
 _FIREBIRDSQL_RETRIES = 5
 _FIREBIRD_DRIVER_RETRIES = 2
 _FIREBIRD_DRIVER_RETRY_DELAY = 0.5
@@ -205,10 +248,34 @@ def _is_firebird_driver_connection_lost(exc):
     if isinstance(exc, (ConnectionError, InterfaceError)):
         return True
     codes = getattr(exc, "gds_codes", None) or ()
-    if any(c in RECONNECT_GDS_CODES for c in codes):
-        return True
+    if codes:
+        # A structured status vector is authoritative: trust it and do
+        # NOT fall back to substring matching.  Otherwise a deliberately
+        # shut-down database (gds 335544528/335544506, intentionally not
+        # in RECONNECT_GDS_CODES) would be misread as transient just
+        # because its message happens to contain "shutdown".
+        return any(c in RECONNECT_GDS_CODES for c in codes)
     msg = str(exc).lower()
     return any(m in msg for m in _RECONNECT_MARKERS)
+
+
+def _is_read_only_batch(query_string):
+    """True if every statement in the batch is a plain ``SELECT``.
+
+    Gates connection-loss retries: replaying a batch is only safe when it
+    cannot have written anything, because the connection may have dropped
+    *after* the server already committed (a stale ``rollback()`` on the
+    dead handle cannot undo that).  We are deliberately conservative --
+    the statement must start with ``SELECT`` after stripping; anything
+    else (INSERT/UPDATE/DELETE/MERGE/EXECUTE, DDL, even a ``WITH`` CTE) is
+    treated as potentially writing and is never retried.  Statements are
+    split on the same NUL separator ``_execute_query`` uses.
+    """
+    statements = [s.strip() for s in query_string.split("\0")]
+    statements = [s for s in statements if s]
+    if not statements:
+        return False
+    return all(s.upper().startswith("SELECT") for s in statements)
 
 
 def _exception_message(exc):
@@ -220,70 +287,68 @@ def _exception_message(exc):
     return msg
 
 
-def _caller_is_manager():
-    """True if the current Zope user has the Manager role.
+# Reasons shared by both driver paths, kept as PLAIN TEXT here; the DA
+# layer (Connection.manage_test) escapes them for the Test tab.
+_CONNECTION_LOST_NO_RETRY = (
+    "Connection to Firebird lost; not retried because the batch is not a "
+    "pure SELECT and replaying it could execute a write twice."
+)
+_CONNECTION_LOST_EXHAUSTED = (
+    "Connection to Firebird lost; reconnect attempts exhausted."
+)
 
-    Gates a single Manager-only convenience in this DA: including the
-    offending SQL snippet in error messages.  Non-Manager callers get
-    sanitised errors without the SQL.
 
-    Uses has_role(('Manager',)) instead of checkPermission because
-    checkPermission needs an Acquisition-wrapped context object,
-    which the DB instance does not have.
+def _base_error_text(exc):
+    """Plain-text message for an exception.
+
+    For OSError use str(): args[0] is the errno (e.g. 32 for a broken
+    pipe), not a message.
     """
-    try:
-        from AccessControl import getSecurityManager
-
-        return getSecurityManager().getUser().has_role(("Manager",))
-    except Exception:
-        # Outside a Zope request (unit test, startup) be conservative:
-        # no SQL in errors.
-        return False
+    if isinstance(exc, OSError):
+        return str(exc)
+    return _exception_message(exc)
 
 
-def _html_safe(value):
-    """Normalise to str, HTML-escape, then render newlines as <br/>.
+def _carry_attrs(target, source, query_string):
+    """Attach the offending SQL to target and copy whatever structured
+    error attributes source carries.
 
-    Defends against Zope TaintedString input (SQL containing < or >)
-    and keeps unescaped error/SQL text out of the HTML output.
+    The attribute names differ per driver (firebird-driver: sqlstate /
+    sqlcode; firebirdsql: sql_code) and gds_codes may be on either, so we
+    copy every known name that is actually set.  The DA layer reads them
+    back defensively when it formats the Test-tab error.
     """
-    return html.escape(str(value), quote=True).replace("\n", "<br/>")
+    target.sql = query_string
+    for name in ("sqlstate", "sqlcode", "sql_code", "gds_codes"):
+        value = getattr(source, name, None)
+        if value is not None:
+            setattr(target, name, value)
 
 
-def _format_firebirdsql_error(exc):
-    """Format a firebirdsql exception as an HTML-safe error message."""
-    msg = _html_safe(_exception_message(exc))
-    op = OperationalError(msg)
-    op.args = (msg,)
+def _operational_error(exc, query_string, prefix=None):
+    """Build an OperationalError with a PLAIN-TEXT message plus the source
+    exception's structured attributes and the offending SQL.
+
+    ``OperationalError`` is the driver-appropriate class (the custom one
+    for firebird-driver, firebirdsql's own otherwise).  For firebird-driver
+    the wrap is also mandatory: the raw firebird.base.types.Error crashes
+    DTML rendering (see the OperationalError docstring).
+    """
+    text = _base_error_text(exc)
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    op = OperationalError(text)
+    _carry_attrs(op, exc, query_string)
     return op
 
 
-def _format_firebird_driver_error(exc, query_string, include_sql=False):
-    """Format a firebird-driver exception as a multi-line message."""
-    parts = ["Firebird query failed."]
-
-    orig = str(exc).strip()
-    if orig:
-        parts.append(f"Error: {_html_safe(orig)}")
-
-    sqlstate = getattr(exc, "sqlstate", None)
-    if sqlstate:
-        if isinstance(sqlstate, bytes):
-            sqlstate = sqlstate.decode("ascii", "replace")
-        parts.append(f"SQLSTATE: {_html_safe(sqlstate)}")
-
-    sqlcode = getattr(exc, "sqlcode", None)
-    if sqlcode is not None:
-        parts.append(f"SQLCODE: {_html_safe(sqlcode)}")
-
-    if query_string and include_sql:
-        snippet = str(query_string).strip()
-        max_len = 2000
-        if len(snippet) > max_len:
-            snippet = snippet[:max_len] + "\n  ... (truncated)"
-        parts.append(f"SQL: {_html_safe(snippet)}")
-
-    return "<br/>".join(parts)
+def _attach_sql(exc, query_string):
+    """Attach the offending SQL to exc and return it for re-raising, so it
+    keeps its original driver type (P3-3) while the DA layer can still
+    show the SQL for Manager callers."""
+    with contextlib.suppress(AttributeError, TypeError):
+        exc.sql = query_string
+    return exc
 
 
 def fetchallmap(c):
@@ -312,16 +377,33 @@ def _convert_dsn(dsn):
 
     firebirdsql:      host:port/path  host:/path
     firebird-driver:  host/port:path  host:path
+
+    The path is interpreted exactly as firebirdsql's urlparse-based
+    ``parse_dsn`` does, so both drivers attach to the same database:
+
+    - The separator after the host/port is a single ``:`` (as in
+      ``host:/path``); a ``/`` (as in ``host:3050/path``) belongs to the
+      path and keeps its leading slash -- otherwise an absolute remote
+      path silently becomes relative.
+    - A single-component ``/alias`` collapses to ``alias``; deeper
+      absolute paths keep their leading slash.
+
+    A DSN without a recognisable ``host[:port]`` prefix (a bare local
+    path like ``/var/db/app.fdb`` or an alias) is passed through
+    unchanged; firebird-driver accepts such strings natively as a local
+    attach, so converting -- or worse, raising -- would only break them.
     """
-    m = re.match(r"^([^:/]+)(?::(\d+))?[:/](.+)$", dsn)
+    # Consume a ':' separator, but only look ahead past a '/' one so the
+    # leading slash stays with the path.
+    m = re.match(r"^([^:/]+)(?::(\d+))?(?::|(?=/))(.+)$", dsn)
     if not m:
-        raise ValueError(f"Unrecognized DSN format: {dsn!r}")
+        return dsn
     host, port, path = m.groups()
-    if port:
-        return f"{host}/{port}:{path}"
-    # /alias (single component) -> alias; /path/to/db stays as-is
+    # Mirror firebirdsql: /alias (single component) -> alias.
     if path.startswith("/") and "/" not in path[1:]:
         path = path[1:]
+    if port:
+        return f"{host}/{port}:{path}"
     return f"{host}:{path}"
 
 
@@ -349,8 +431,15 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         self.opened = None
         if conn is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             conn.close()
+        except Exception:
+            # Never propagate: close() runs inside error handlers and
+            # retry paths, where a raised close error would mask the
+            # original exception. Log it instead -- a failing detach can
+            # leave the server-side attachment open, which matters when
+            # chasing "too many open handles".
+            LOG.warning("Error closing the Firebird connection.", exc_info=True)
 
     def __init__(self, connection):
         conn_args = dict(s.split("=", 1) for s in connection.split())
@@ -365,7 +454,10 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         try:
             queries = [q for q in (s.strip() for s in query_string.split("\0")) if q]
             if not queries:
-                raise OperationalError("empty query")
+                # An empty/whitespace query yields an empty result, as it
+                # has since the Zope 4 port (queries used to be a py3
+                # filter object, so ``if not queries`` was never true).
+                return (), ()
             desc = None
             result = []
             for qs in queries:
@@ -383,6 +475,11 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                 if len(result) < max_rows:
                     r = c.fetchmany(max_rows - len(result))
                     if r:
+                        if _DRIVER == "firebird-driver":
+                            # Read open BLOB streams now, while the cursor
+                            # is still on this statement -- the commit
+                            # below closes it and with it the readers.
+                            r = [_materialize_row(row) for row in r]
                         result += r
 
             if _DRIVER == "firebird-driver":
@@ -424,43 +521,89 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
             return self._query_firebirdsql(query_string, max_rows)
         return self._query_firebird_driver(query_string, max_rows)
 
+    def _reconnect_for_retry(self, query_string, exc, delay=0):
+        """Gate a firebirdsql connection-loss retry to pure SELECT batches,
+        then close so the loop's guard reopens on the next pass.
+
+        Raises for a non-SELECT batch (after closing, so the next request
+        reconnects via the guard): firebirdsql autocommits per statement,
+        so replaying it after a mid-batch drop could commit a write twice
+        (a single INSERT can be through server-side even if only the reply
+        was lost). Only self.close() here -- the reopen happens inside the
+        loop's try, where a failed reconnect is caught and retried instead
+        of escaping raw.
+        """
+        if not _is_read_only_batch(query_string):
+            # Close before raising -- otherwise a pure-write worker would
+            # keep hitting the dead connection on every request.
+            self.close()
+            raise _operational_error(
+                exc, query_string, prefix=_CONNECTION_LOST_NO_RETRY
+            ) from exc
+        if delay:
+            time.sleep(delay)
+        self.close()
+
     def _query_firebirdsql(self, query_string, max_rows):
-        """Run query via firebirdsql with retries for transient errors."""
+        """Run query via firebirdsql with retries for transient errors.
+
+        Connection-loss retries are gated to pure SELECT batches, like the
+        firebird-driver path. Non-transient errors keep their original
+        firebirdsql type (P3-3); db.py raises plain text and the DA layer
+        escapes it for the Test tab.
+        """
         last_exc = None
         for i in range(_FIREBIRDSQL_RETRIES):
             try:
+                if self.opened is None:
+                    # Reopen after an explicit close() (e.g. the ZMI
+                    # "Close Connection" button) or a failed reconnect --
+                    # firebirdsql leaves self.conn as None, so without
+                    # this guard every later query would hit None.cursor().
+                    self.open()
                 return self._execute_query(query_string, max_rows)
 
             except OperationalError as e:
-                last_exc = e
                 msg = _exception_message(e)
                 if msg in (
                     "Can not recv() packets",
                     "_op_allocate_statement() Invalid db handle",
                 ):
-                    time.sleep(1)
-                    self.close()
-                    self.open()
+                    last_exc = e
+                    self._reconnect_for_retry(query_string, e, delay=1)
                 elif "too many open handles to database" in msg:
-                    self.close()
-                    self.open()
+                    last_exc = e
+                    self._reconnect_for_retry(query_string, e)
                 else:
-                    raise _format_firebirdsql_error(e) from e
+                    # SQL / logic error: keep the original type (P3-3).
+                    raise _attach_sql(e, query_string)
             except Error as e:
-                raise _format_firebirdsql_error(e) from e
-            except BrokenPipeError as e:
+                raise _attach_sql(e, query_string)
+            except OSError as e:
+                # Covers BrokenPipeError from a dying socket AND the raw
+                # OS errors the reopen guard's connect() raises while the
+                # server is still down or unreachable -- not just
+                # ConnectionError/TimeoutError, but also socket.gaierror
+                # (DNS) and EHOSTUNREACH/ENETUNREACH, which are plain
+                # OSError. So a failed reconnect is retried instead of
+                # escaping raw and skipping the remaining attempts.
                 last_exc = e
-                self.close()
-                self.open()
-        exc = _format_firebirdsql_error(last_exc)
-        exc.args = (
-            f"Firebird query failed after {_FIREBIRDSQL_RETRIES} retries: "
-            + exc.args[0],
-        )
-        raise exc from last_exc
+                self._reconnect_for_retry(query_string, e)
+        raise _operational_error(
+            last_exc,
+            query_string,
+            prefix=f"Firebird query failed after {_FIREBIRDSQL_RETRIES} retries.",
+        ) from last_exc
 
     def _query_firebird_driver(self, query_string, max_rows):
-        """Run query via firebird-driver with retry and error enrichment."""
+        """Run query via firebird-driver with reconnect retries.
+
+        SQL/logic errors are wrapped in the custom OperationalError (plain
+        text + structured .sql/.sqlstate/.sqlcode) because the raw
+        firebird.base.types.Error crashes DTML rendering. Connection-loss
+        retries are gated to pure SELECT batches. The DA layer escapes the
+        message and, for Manager callers, appends the SQL for the Test tab.
+        """
         last_exc = None
         for attempt in range(_FIREBIRD_DRIVER_RETRIES):
             try:
@@ -468,23 +611,25 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
                     self.open()
                 return self._execute_query(query_string, max_rows)
 
-            except (Error, ConnectionError) as e:
+            except (Error, ConnectionError, InterfaceError) as e:
                 if not _is_firebird_driver_connection_lost(e):
-                    # SQL / logic error: enrich and re-raise.
-                    msg = _format_firebird_driver_error(
-                        e, query_string, include_sql=_caller_is_manager()
-                    )
-                    raise OperationalError(msg) from e
+                    # SQL / logic error: wrap as plain text, keep attrs.
+                    raise _operational_error(e, query_string) from e
+                if not _is_read_only_batch(query_string):
+                    # Connection lost on a batch that may write. The commit
+                    # can already have reached the server before the drop,
+                    # so replaying the batch risks a duplicate write --
+                    # surface the loss immediately instead. Close first so
+                    # the next request reconnects via the guard above.
+                    self.close()
+                    raise _operational_error(
+                        e, query_string, prefix=_CONNECTION_LOST_NO_RETRY
+                    ) from e
                 last_exc = e
                 self.close()
                 if attempt < _FIREBIRD_DRIVER_RETRIES - 1:
                     time.sleep(_FIREBIRD_DRIVER_RETRY_DELAY)
 
-        msg = (
-            "Connection to Firebird lost; reconnect attempts "
-            "exhausted.\n\n"
-            + _format_firebird_driver_error(
-                last_exc, query_string, include_sql=_caller_is_manager()
-            )
-        )
-        raise OperationalError(msg) from last_exc
+        raise _operational_error(
+            last_exc, query_string, prefix=_CONNECTION_LOST_EXHAUSTED
+        ) from last_exc
