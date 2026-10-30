@@ -95,6 +95,24 @@ effects -- ``SELECT GEN_ID(SEQ, 1) FROM RDB$DATABASE`` or a selectable
 stored procedure that writes -- passes the gate and may be executed a
 second time after a reconnect.
 
+ConnectionIdleTimeout
+---------------------
+
+Leave ``ConnectionIdleTimeout`` unset in ``firebird.conf`` and
+``databases.conf``.  The engine default of 0 disables the idle timer.
+
+FirebirdDA keeps one connection open for the life of the Zope worker.
+Between requests that attachment is idle on purpose.  A short timeout
+closes it.  The next request then receives ``isc_att_shutdown`` with
+the secondary error ``isc_att_shut_idle``.  A pure ``SELECT`` is
+retried once.  An ``INSERT``, ``UPDATE``, ``DELETE`` or ``WITH`` is
+not retried, so that request fails.  The following request opens a
+new connection.
+
+A timeout of several hours still reclaims an attachment whose TCP
+close the server never noticed, and it can fail the first write after
+a long quiet period.  Leave the setting unset to avoid that.
+
 Test Tab
 --------
 

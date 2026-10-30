@@ -80,8 +80,19 @@ Reliability
   detach on a dead attachment and kills the Zope process; a ping
   immediately before detach is not a safe gate.  Every close nulls
   ``_att`` first and then does best-effort local cleanup only.
-  Server-side attachments may linger until Firebird's attachment
-  timeout.  ``firebirdsql`` still closes normally.
+  A normal remote close still ends the server attachment: dropping
+  the handle runs ``release()``, which sends ``op_detach`` and closes
+  the socket.  Closing a healthy attachment this way does not consult
+  ``ConnectionIdleTimeout``.  A configured timeout can still close an
+  attachment that Zope keeps idle between requests.  Leaving the
+  setting unset, the engine default of 0, does not.  An attachment
+  can still linger only when the TCP session was already dead and the
+  server does not notice the close.  ``firebirdsql`` still closes
+  normally.
+- Document that ``ConnectionIdleTimeout`` should stay unset.  The
+  adapter keeps its connection for the life of the Zope worker.  A
+  short timeout closes that attachment during a quiet period, and the
+  next non-``SELECT`` request fails instead of being retried.
 - Serialize ``open`` / ``close`` / ``query`` on a per-``DB`` ``RLock``
   so Waitress worker threads cannot overlap lifecycle operations on
   the same shared connection.

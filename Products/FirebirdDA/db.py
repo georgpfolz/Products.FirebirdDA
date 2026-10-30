@@ -466,8 +466,16 @@ class DB(Shared.DC.ZRDB.THUNK.THUNKED_TM):
         Zope process.  Even a successful ``ping()`` is not a reliable
         gate (TOCTOU / threads).  We always null ``_att`` first
         so ``Connection.__del__`` cannot detach, then best-effort
-        Python-side cleanup.  Server-side the attachment may linger
-        until the server times it out — preferable to a process crash.
+        Python-side cleanup.  A normal remote close still ends the
+        server attachment: dropping the handle runs ``release()``,
+        which sends ``op_detach`` and closes the socket.  Closing a
+        healthy attachment this way does not consult
+        ``ConnectionIdleTimeout``.  A configured timeout can still
+        close an attachment that stays idle between requests; leave
+        the setting unset so that does not happen.  An attachment
+        can still linger only when the TCP session was already dead
+        and the server does not notice the close.  Skipping
+        ``detach()`` is preferable to a process crash.
 
         *abandon* only changes the log reason/level (connection-loss vs
         normal close).  ``firebirdsql`` is pure Python and keeps a
